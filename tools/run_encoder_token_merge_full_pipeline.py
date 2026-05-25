@@ -55,6 +55,18 @@ def parse_args():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--profile_segments",
+        action="store_true",
+        help="record patch/pre-merge/merge/post-merge/norm/restore/total timing inside the encoder",
+    )
+    parser.add_argument(
+        "--no_profile_segments",
+        dest="profile_segments",
+        action="store_false",
+        help="disable internal segment timing",
+    )
+    parser.set_defaults(profile_segments=False)
     return parser.parse_args()
 
 
@@ -168,6 +180,7 @@ def load_model(args, checkpoint_path, num_frames, merge_layers):
         "strategy": args.strategy,
         "receiver": args.receiver,
         "restore_dense": True,
+        "profile": bool(args.profile_segments),
     }
     model = getattr(vision_transformer, args.model_arch)(
         img_size=(args.img_size, args.img_size),
@@ -208,13 +221,19 @@ def synchronize(device):
         torch.cuda.synchronize()
 
 
-def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, receiver):
+def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, receiver, profile):
+    if str(strategy) == "local_2x2_same_time_vec" and len(tuple(merge_layers)) > 1:
+        raise ValueError(
+            "local_2x2_same_time_vec currently supports exactly one merge layer. "
+            "Use a single layer for vectorized benchmarking."
+        )
     model.merge_config.enabled = bool(enabled)
     model.merge_config.merge_layers = tuple(int(v) for v in merge_layers)
     model.merge_config.merge_ratio = float(merge_ratio)
     model.merge_config.strategy = str(strategy)
     model.merge_config.receiver = str(receiver)
     model.merge_config.restore_dense = True
+    model.merge_config.profile = bool(profile)
     if getattr(model, "token_merger", None) is not None:
         model.token_merger.config = model.merge_config
 
@@ -228,6 +247,7 @@ def run_timed_forward(model, video, args, *, enabled, merge_layers, merge_ratio)
         merge_ratio=merge_ratio,
         strategy=args.strategy,
         receiver=args.receiver,
+        profile=bool(args.profile_segments),
     )
     if str(args.device).startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
@@ -241,12 +261,13 @@ def run_timed_forward(model, video, args, *, enabled, merge_layers, merge_ratio)
         out, infos = model(video, return_merge_info=True, restore_dense=True)
     synchronize(args.device)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
+    profile = dict(getattr(model, "last_forward_profile", {}) or {})
     peak_mb = (
         torch.cuda.max_memory_allocated() / (1024**2)
         if str(args.device).startswith("cuda")
         else None
     )
-    return out.detach().float().cpu(), infos, elapsed_ms, peak_mb
+    return out.detach().float().cpu(), infos, elapsed_ms, peak_mb, profile
 
 
 def summarize_times(values):
@@ -257,6 +278,26 @@ def summarize_times(values):
         "min_ms": float(np.min(values)),
         "max_ms": float(np.max(values)),
     }
+
+
+PROFILE_FIELDS = [
+    "patch_embed_ms",
+    "pre_merge_blocks_ms",
+    "merge_module_ms",
+    "post_merge_blocks_ms",
+    "norm_ms",
+    "restore_dense_ms",
+    "total_profiled_ms",
+]
+
+
+def summarize_profile(profiles):
+    out = {}
+    for key in PROFILE_FIELDS:
+        vals = [float(item.get(key, 0.0)) for item in profiles if item]
+        out[f"{key}_mean"] = float(np.mean(vals)) if vals else 0.0
+        out[f"{key}_median"] = float(np.median(vals)) if vals else 0.0
+    return out
 
 
 def write_csv(rows, out_dir):
@@ -271,10 +312,20 @@ def write_csv(rows, out_dir):
         "tokens_removed",
         "latency_ms_mean",
         "latency_ms_median",
+        "patch_embed_ms_mean",
+        "pre_merge_blocks_ms_mean",
+        "merge_module_ms_mean",
+        "post_merge_blocks_ms_mean",
+        "norm_ms_mean",
+        "restore_dense_ms_mean",
+        "total_profiled_ms_mean",
         "peak_memory_mb_mean",
         "mean_cosine",
         "relative_l2",
         "sequence_reduced",
+        "final_implementation",
+        "any_fallback",
+        "fallback_reasons",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -378,8 +429,9 @@ def main():
         outputs = []
         latencies = []
         memories = []
+        profiles = []
         for _ in range(max(1, int(args.repeats))):
-            out, infos, elapsed_ms, peak_mb = run_timed_forward(
+            out, infos, elapsed_ms, peak_mb, profile = run_timed_forward(
                 model,
                 video,
                 args,
@@ -389,8 +441,10 @@ def main():
             )
             outputs.append(out)
             latencies.append(elapsed_ms)
+            profiles.append(profile)
             if peak_mb is not None:
                 memories.append(peak_mb)
+        profile_summary = summarize_profile(profiles)
         baseline_outputs.append(outputs[-1])
         row = {
             "config": "baseline",
@@ -402,11 +456,13 @@ def main():
             "tokens_removed": 0,
             "latency_ms_mean": float(np.mean(latencies)),
             "latency_ms_median": float(np.median(latencies)),
+            **profile_summary,
             "peak_memory_mb_mean": float(np.mean(memories)) if memories else None,
             "mean_cosine": 1.0,
             "relative_l2": 0.0,
             "sequence_reduced": False,
             "latency": summarize_times(latencies),
+            "profile": profile_summary,
         }
         baseline_rows.append(row)
         baseline_latencies.extend(latencies)
@@ -432,8 +488,9 @@ def main():
             infos_last = []
             latencies = []
             memories = []
+            profiles = []
             for _ in range(max(1, int(args.repeats))):
-                out, infos, elapsed_ms, peak_mb = run_timed_forward(
+                out, infos, elapsed_ms, peak_mb, profile = run_timed_forward(
                     model,
                     video,
                     args,
@@ -444,14 +501,21 @@ def main():
                 outputs.append(out)
                 infos_last = infos
                 latencies.append(elapsed_ms)
+                profiles.append(profile)
                 if peak_mb is not None:
                     memories.append(peak_mb)
+            profile_summary = summarize_profile(profiles)
             y = baseline_outputs[sample_idx]
             y_merge = outputs[-1]
             cos = F.cosine_similarity(y, y_merge, dim=-1).reshape(-1)
             diff = y - y_merge
             rel_l2 = float(diff.norm().item() / y.norm().clamp_min(1e-12).item())
-            info = infos_last[0] if infos_last else {}
+            info = infos_last[-1] if infos_last else {}
+            fallback_reasons = [
+                str(item.get("fallback_reason"))
+                for item in infos_last
+                if item.get("fallback_reason") is not None
+            ]
             tokens_before = int(info.get("num_tokens_before", y.shape[1]))
             tokens_after = int(info.get("num_tokens_after", y_merge.shape[1]))
             row = {
@@ -464,6 +528,7 @@ def main():
                 "tokens_removed": int(tokens_before - tokens_after),
                 "latency_ms_mean": float(np.mean(latencies)),
                 "latency_ms_median": float(np.median(latencies)),
+                **profile_summary,
                 "peak_memory_mb_mean": float(np.mean(memories)) if memories else None,
                 "mean_cosine": float(cos.mean().item()),
                 "median_cosine": float(cos.median().item()),
@@ -471,8 +536,13 @@ def main():
                 "relative_l2": rel_l2,
                 "mse": float(diff.square().mean().item()),
                 "sequence_reduced": bool(info.get("sequence_reduced", False)),
+                "final_implementation": str(info.get("implementation", "")),
+                "any_fallback": bool(fallback_reasons),
+                "fallback_reasons": ";".join(fallback_reasons),
+                "final_merge_info": info,
                 "merge_info": infos_last,
                 "latency": summarize_times(latencies),
+                "profile": profile_summary,
             }
             config_rows.append(row)
             all_rows.append(row)
@@ -483,6 +553,10 @@ def main():
             for row in config_rows
             if row["peak_memory_mb_mean"] is not None
         ]
+        profile_aggregate = {
+            key: float(np.mean([row.get(key, 0.0) for row in config_rows]))
+            for key in [f"{field}_mean" for field in PROFILE_FIELDS]
+        }
         config_summaries.append(
             {
                 "config": config_name,
@@ -491,6 +565,7 @@ def main():
                 "samples": config_rows,
                 "aggregate": {
                     "latency": summarize_times(lat_all),
+                    "profile": profile_aggregate,
                     "peak_memory_mb_mean": float(np.mean(mem_all)) if mem_all else None,
                     "tokens_before": int(np.mean([r["tokens_before"] for r in config_rows])),
                     "tokens_after": int(np.mean([r["tokens_after"] for r in config_rows])),
@@ -499,6 +574,10 @@ def main():
                     "relative_l2": float(np.mean([r["relative_l2"] for r in config_rows])),
                     "sequence_reduced_all": bool(
                         all(r["sequence_reduced"] for r in config_rows)
+                    ),
+                    "any_fallback": bool(any(r.get("any_fallback") for r in config_rows)),
+                    "final_implementations": sorted(
+                        {str(r.get("final_implementation", "")) for r in config_rows}
                     ),
                 },
             }
@@ -509,6 +588,10 @@ def main():
         "samples": baseline_rows,
         "aggregate": {
             "latency": summarize_times(baseline_latencies),
+            "profile": {
+                key: float(np.mean([row.get(key, 0.0) for row in baseline_rows]))
+                for key in [f"{field}_mean" for field in PROFILE_FIELDS]
+            },
             "peak_memory_mb_mean": (
                 float(np.mean(baseline_memories)) if baseline_memories else None
             ),

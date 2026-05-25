@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import time
 from functools import partial
 
 import torch
@@ -15,6 +16,12 @@ from src.models.utils.patch_embed import PatchEmbed, PatchEmbed3D
 from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.models.utils.token_merge import LocalTokenMerger, init_token_merge_state, normalize_merge_config, restore_dense_tokens
 from src.utils.tensors import trunc_normal_
+
+
+def _profile_now(device, enabled):
+    if enabled and device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
 
 
 class VisionTransformer(nn.Module):
@@ -167,6 +174,19 @@ class VisionTransformer(nn.Module):
         :param x: input image/video
         :param masks: indices of patch tokens to mask (remove)
         """
+        profile_enabled = bool(getattr(self.merge_config, "profile", False))
+        profile_device = x.device
+        profile_total_start = _profile_now(profile_device, profile_enabled)
+        profile = {
+            "profile_enabled": bool(profile_enabled),
+            "patch_embed_ms": 0.0,
+            "pre_merge_blocks_ms": 0.0,
+            "merge_module_ms": 0.0,
+            "post_merge_blocks_ms": 0.0,
+            "norm_ms": 0.0,
+            "restore_dense_ms": 0.0,
+            "total_profiled_ms": 0.0,
+        }
         merge_enabled = bool(self.merge_config.enabled)
         restore_dense = self.merge_config.restore_dense if restore_dense is None else bool(restore_dense)
         if merge_enabled and masks is not None:
@@ -195,12 +215,16 @@ class VisionTransformer(nn.Module):
         if not self.handle_nonsquare_inputs:
             T = H_patches = W_patches = None
 
+        patch_start = _profile_now(profile_device, profile_enabled)
         if not self.use_rope:
             pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
             x = self.patch_embed(x)
             x += pos_embed
         else:
             x = self.patch_embed(x)
+        profile["patch_embed_ms"] = (
+            _profile_now(profile_device, profile_enabled) - patch_start
+        ) * 1000.0
 
         original_num_tokens = x.shape[1]
         token_ids = token_size = rep_for_orig = None
@@ -220,6 +244,8 @@ class VisionTransformer(nn.Module):
 
         # Fwd prop
         outs = []
+        block_segment_start = _profile_now(profile_device, profile_enabled)
+        seen_merge = False
         for i, blk in enumerate(self.blocks):
             if self.use_activation_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
@@ -242,7 +268,14 @@ class VisionTransformer(nn.Module):
                     W_patches=W_patches,
                 )
             if merge_enabled and i in self.merge_config.merge_layers:
+                block_segment_end = _profile_now(profile_device, profile_enabled)
+                block_segment_ms = (block_segment_end - block_segment_start) * 1000.0
+                if seen_merge:
+                    profile["post_merge_blocks_ms"] += block_segment_ms
+                else:
+                    profile["pre_merge_blocks_ms"] += block_segment_ms
                 before = x.shape[1]
+                merge_start = _profile_now(profile_device, profile_enabled)
                 x, token_ids, token_size, rep_for_orig, info = self.token_merger(
                     x=x,
                     token_ids=token_ids,
@@ -252,11 +285,18 @@ class VisionTransformer(nn.Module):
                     h_grid=H_patches,
                     w_grid=W_patches,
                 )
+                measured_merge_ms = (
+                    _profile_now(profile_device, profile_enabled) - merge_start
+                ) * 1000.0
+                profile["merge_module_ms"] += measured_merge_ms
                 info["layer"] = int(i)
                 info["original_num_tokens"] = int(original_num_tokens)
                 info["restore_dense"] = bool(restore_dense)
                 info["sequence_reduced"] = bool(x.shape[1] < before)
+                info["measured_merge_ms"] = float(measured_merge_ms)
                 merge_infos.append(info)
+                seen_merge = True
+                block_segment_start = _profile_now(profile_device, profile_enabled)
             if self.out_layers is not None and i in self.out_layers:
                 out = self.norm(x)
                 if merge_enabled and restore_dense:
@@ -265,14 +305,36 @@ class VisionTransformer(nn.Module):
 
         if self.out_layers is not None:
             if return_merge_info:
+                self.last_forward_profile = profile
                 return outs, merge_infos
             return outs
 
+        block_segment_end = _profile_now(profile_device, profile_enabled)
+        block_segment_ms = (block_segment_end - block_segment_start) * 1000.0
+        if seen_merge:
+            profile["post_merge_blocks_ms"] += block_segment_ms
+        else:
+            profile["pre_merge_blocks_ms"] += block_segment_ms
+
+        norm_start = _profile_now(profile_device, profile_enabled)
         if self.norm is not None:
             x = self.norm(x)
+        profile["norm_ms"] = (
+            _profile_now(profile_device, profile_enabled) - norm_start
+        ) * 1000.0
 
+        restore_start = _profile_now(profile_device, profile_enabled)
         if merge_enabled and restore_dense:
             x = restore_dense_tokens(x, token_ids, rep_for_orig, original_num_tokens)
+        profile["restore_dense_ms"] = (
+            _profile_now(profile_device, profile_enabled) - restore_start
+        ) * 1000.0
+        profile["total_profiled_ms"] = (
+            _profile_now(profile_device, profile_enabled) - profile_total_start
+        ) * 1000.0
+        profile["tokens_final"] = int(x.shape[1])
+        profile["tokens_original"] = int(original_num_tokens)
+        self.last_forward_profile = profile
 
         if return_merge_info:
             return x, merge_infos
