@@ -1,0 +1,25 @@
+{
+  "stage5_output_root": "outputs/token_merge_abc_20260526_stage5_layer_sweep_512_full64",
+  "stage5_report_root": "reports/token_merge_abc_20260526_stage5_layer_sweep",
+  "stage6_output_root": "outputs/token_merge_abc_20260526_stage6_downstream_l12_fulltiny",
+  "closure_report": "reports/token_merge_abc_20260526_stage5_stage6_closure/thinkjepa_token_merge_stage5_stage6_closure_report.md",
+  "stage5_encoder_rows": 36,
+  "stage6_configs": [
+    "A_l12_r005",
+    "A_l12_r010",
+    "B_l12_r005",
+    "B_l12_r010",
+    "C_l12_r005",
+    "baseline"
+  ],
+  "stage6_epochs_each": {
+    "A_l12_r005": 50,
+    "A_l12_r010": 50,
+    "B_l12_r005": 50,
+    "B_l12_r010": 50,
+    "C_l12_r005": 50,
+    "baseline": 50
+  },
+  "baseline_ade": 0.11799277365207672,
+  "any_stage5_fallback": false
+}
