@@ -16,6 +16,17 @@
 | merge位置 | encoder block 后，物理缩短 hidden patch token sequence，最后 `restore_dense=True` 接回 predictor |
 | 方法 | A similarity-only；B norm_motion/local_top1 importance-protected；C hybrid score |
 
+## Stage0-Stage6 对照审计表
+| Stage | 原计划要求 | 当前证据路径 | 验收状态 |
+|---|---|---|---|
+| Stage0 | baseline、r0 sanity、CLI/CSV/config 扩展，确认 no-merge 与 merge path 不破坏输出 | `outputs/token_merge_abc_20260526_final/256_A_same_time_vec/full_pipeline_metrics.csv`；`reports/token_merge_abc_20260526/thinkjepa_token_merge_iterative_report.md` | 已完成。baseline 与 r0 sanity 存在，r0 cosine 为 1.0，新增字段已进入 CSV/JSON |
+| Stage1 | A similarity-only vectorized baseline，记录 p10/p1 cosine、latency、fallback | `outputs/token_merge_abc_20260526_final/256_A_same_time_vec/full_pipeline_metrics.csv`；`outputs/token_merge_abc_20260526_stage5_layer_sweep_512_full64/A_l*/full_pipeline_metrics.csv` | 已完成。A 覆盖 256 layer8 sweep 与 512 layer4/6/8/12 sweep，`any_fallback=false` |
+| Stage2 | importance score diagnostic，比较 `norm`、`motion`、`norm_motion`、`qk_global_hidden`，不把 proxy 当真实 attention | `outputs/token_merge_abc_20260526/stage2_importance_diagnostic_256_full64/*/full_pipeline_metrics.csv`；`outputs/token_merge_abc_20260526_iter2/B_source_*/full_pipeline_metrics.csv` | 已完成。importance 分布与 source ablation 已记录；`qk_global_hidden` 在报告中限定为 hidden proxy |
+| Stage3 | B importance-protected merge，验证 receiver/source importance、actual ratio、B 是否优于 A | `outputs/token_merge_abc_20260526_final/256_B_norm_motion/full_pipeline_metrics.csv`；`outputs/token_merge_abc_20260526_stage5_layer_sweep_512_full64/B_l*/full_pipeline_metrics.csv` | 已完成但结果为负/中性。B 与 A 几乎持平，没有稳定优于 A |
+| Stage4 | C hybrid similarity+importance score，验证 C 是否优于 B/A | `outputs/token_merge_abc_20260526_final/256_C_norm_motion/full_pipeline_metrics.csv`；`outputs/token_merge_abc_20260526_stage5_layer_sweep_512_full64/C_l*/full_pipeline_metrics.csv`；`outputs/token_merge_abc_20260526_iter3/C_nm_*/full_pipeline_metrics.csv` | 已完成但结果为负。C 在 encoder fidelity 上低于 A/B，不作为主方法 |
+| Stage5 | 512x512 encoder-only benchmark：A/B/C × layer 4/6/8/12 × ratio 0.05/0.10/0.125，全 64 帧、全 tiny-cache、profile breakdown | `outputs/token_merge_abc_20260526_stage5_layer_sweep_512_full64/`；`reports/token_merge_abc_20260526_stage5_layer_sweep/pareto_table.csv`；`reports/token_merge_abc_20260526_stage5_stage6_closure/stage5_profile_breakdown_l12.csv` | 已补齐。12 个 run 目录、36 行 Pareto 结果、`any_fallback=false`，代表性 layer12 profile 已汇总 |
+| Stage6 | downstream small/full tiny-cache：baseline 与 Pareto candidates，不能停留在 smoke/5 epoch | `outputs/token_merge_abc_20260526_stage6_downstream_l12_fulltiny/`；`reports/token_merge_abc_20260526_stage5_stage6_closure/stage6_downstream_l12_fulltiny_summary.csv` | 已补齐 tiny-cache 级验证。baseline、A/B layer12 r0.05/r0.10、C layer12 r0.05 均完成 50 epochs；仍不等同完整 EgoDex benchmark |
+
 ## Stage5: 512x512 Layer Sweep 核心结果
 | scope | ratio | speedup | tokens_after | mean_cos | p10 | p1 | mem_delta | fallback |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
