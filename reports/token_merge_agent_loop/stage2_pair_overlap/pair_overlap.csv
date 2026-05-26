@@ -1,0 +1,5 @@
+baseline_config,config,baseline_decisions,config_decisions,shared_cells,cell_overlap,undirected_pair_overlap,directed_pair_overlap,mean_selected_similarity_drop_vs_baseline,p10_selected_similarity_drop_vs_baseline,mean_best_similarity_gap,fraction_lower_similarity_than_baseline,mean_source_importance_delta_vs_baseline,mean_receiver_importance_delta_vs_baseline
+A_sim_same_time_vec_l12_r0.05_512,B2_keep_redundancy_cell_l12_r0.05_512,4914,4914,4914,1.0,1.0,0.497964997964998,0.0,0.0,0.0,0.0,,
+A_sim_same_time_vec_l12_r0.125_512,B2_keep_redundancy_cell_l12_r0.125_512,12288,12288,12288,1.0,1.0,0.4942220052083333,0.0,0.0,0.0,0.0,,
+A_sim_same_time_vec_l12_r0.05_512,C2_gated_norm_motion_eps0.01_l12_r0.05_512,4914,4914,4833,0.9835164835164835,0.9942064969997931,0.6399751707014277,1.0785073837384462e-06,0.0,1.0785073837384462e-06,0.005793503000206911,,
+A_sim_same_time_vec_l12_r0.125_512,C2_gated_norm_motion_eps0.01_l12_r0.125_512,12288,12288,12203,0.9930826822916666,0.9913955584692289,0.6424649676309104,1.5659956700350723e-06,0.0,1.5659956700350723e-06,0.008604441530771122,,

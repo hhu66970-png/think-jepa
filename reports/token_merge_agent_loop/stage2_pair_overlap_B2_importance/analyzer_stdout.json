@@ -1,0 +1,40 @@
+{
+  "baselines": {
+    "0.05": "A_sim_same_time_vec_l12_r0.05_512",
+    "0.125": "A_sim_same_time_vec_l12_r0.125_512"
+  },
+  "comparisons": [
+    {
+      "baseline_config": "A_sim_same_time_vec_l12_r0.05_512",
+      "config": "B2_keep_importance_cell_l12_r0.05_512",
+      "baseline_decisions": 4914,
+      "config_decisions": 4914,
+      "shared_cells": 3118,
+      "cell_overlap": 0.6345136345136345,
+      "undirected_pair_overlap": 0.791853752405388,
+      "directed_pair_overlap": 0.5262989095574085,
+      "mean_selected_similarity_drop_vs_baseline": 0.000857349597467223,
+      "p10_selected_similarity_drop_vs_baseline": 0.0,
+      "mean_best_similarity_gap": 0.000857349597467223,
+      "fraction_lower_similarity_than_baseline": 0.20814624759461192,
+      "mean_source_importance_delta_vs_baseline": "",
+      "mean_receiver_importance_delta_vs_baseline": ""
+    },
+    {
+      "baseline_config": "A_sim_same_time_vec_l12_r0.125_512",
+      "config": "B2_keep_importance_cell_l12_r0.125_512",
+      "baseline_decisions": 12288,
+      "config_decisions": 12288,
+      "shared_cells": 9296,
+      "cell_overlap": 0.7565104166666666,
+      "undirected_pair_overlap": 0.6641566265060241,
+      "directed_pair_overlap": 0.4396514629948365,
+      "mean_selected_similarity_drop_vs_baseline": 0.002404514430876238,
+      "p10_selected_similarity_drop_vs_baseline": 0.0,
+      "mean_best_similarity_gap": 0.002404514430876238,
+      "fraction_lower_similarity_than_baseline": 0.3358433734939759,
+      "mean_source_importance_delta_vs_baseline": "",
+      "mean_receiver_importance_delta_vs_baseline": ""
+    }
+  ]
+}

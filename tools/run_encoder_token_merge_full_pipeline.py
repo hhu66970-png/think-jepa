@@ -65,6 +65,20 @@ def parse_args():
     parser.add_argument("--lambda_norm", type=float, default=0.3)
     parser.add_argument("--lambda_motion", type=float, default=0.7)
     parser.add_argument("--debug_dump_scores", action="store_true")
+    parser.add_argument("--dump_merge_decisions", action="store_true")
+    parser.add_argument("--max_decision_dump", type=int, default=8192)
+    parser.add_argument(
+        "--keep_source",
+        type=str,
+        default="redundancy",
+        choices=["redundancy", "importance", "importance_redundancy", "random"],
+    )
+    parser.add_argument("--receiver_search", type=str, default="cell", choices=["cell"])
+    parser.add_argument("--keep_score_alpha", type=float, default=1.0)
+    parser.add_argument("--keep_score_beta", type=float, default=0.0)
+    parser.add_argument("--similarity_gate_epsilon", type=float, default=0.01)
+    parser.add_argument("--direction_by_importance", action="store_true", default=True)
+    parser.add_argument("--no_direction_by_importance", dest="direction_by_importance", action="store_false")
     parser.add_argument("--run_no_merge_baseline", action="store_true")
     parser.add_argument("--run_r0_sanity", action="store_true")
     parser.add_argument("--repeats", type=int, default=5)
@@ -208,6 +222,14 @@ def load_model(args, checkpoint_path, num_frames, merge_layers):
         "lambda_norm": float(args.lambda_norm),
         "lambda_motion": float(args.lambda_motion),
         "debug_dump_scores": bool(args.debug_dump_scores),
+        "dump_merge_decisions": bool(args.dump_merge_decisions),
+        "max_decision_dump": int(args.max_decision_dump),
+        "keep_source": str(args.keep_source),
+        "receiver_search": str(args.receiver_search),
+        "keep_score_alpha": float(args.keep_score_alpha),
+        "keep_score_beta": float(args.keep_score_beta),
+        "similarity_gate_epsilon": float(args.similarity_gate_epsilon),
+        "direction_by_importance": bool(args.direction_by_importance),
     }
     model = getattr(vision_transformer, args.model_arch)(
         img_size=(args.img_size, args.img_size),
@@ -253,6 +275,8 @@ def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, rec
         "local_2x2_same_time_vec",
         "local_2x2_importance_protected_vec",
         "local_2x2_hybrid_score_vec",
+        "local_keep_then_merge_vec",
+        "local_2x2_similarity_gated_importance_vec",
     }
     if str(strategy) in vectorized_strategies and len(tuple(merge_layers)) > 1:
         raise ValueError(
@@ -283,6 +307,14 @@ def set_merge_experiment_fields(model, args):
     model.merge_config.lambda_norm = float(args.lambda_norm)
     model.merge_config.lambda_motion = float(args.lambda_motion)
     model.merge_config.debug_dump_scores = bool(args.debug_dump_scores)
+    model.merge_config.dump_merge_decisions = bool(args.dump_merge_decisions)
+    model.merge_config.max_decision_dump = int(args.max_decision_dump)
+    model.merge_config.keep_source = str(args.keep_source)
+    model.merge_config.receiver_search = str(args.receiver_search)
+    model.merge_config.keep_score_alpha = float(args.keep_score_alpha)
+    model.merge_config.keep_score_beta = float(args.keep_score_beta)
+    model.merge_config.similarity_gate_epsilon = float(args.similarity_gate_epsilon)
+    model.merge_config.direction_by_importance = bool(args.direction_by_importance)
     if getattr(model, "token_merger", None) is not None:
         model.token_merger.config = model.merge_config
 
@@ -368,6 +400,12 @@ def write_csv(rows, out_dir):
         "score_delta",
         "lambda_norm",
         "lambda_motion",
+        "keep_source",
+        "receiver_search",
+        "keep_score_alpha",
+        "keep_score_beta",
+        "similarity_gate_epsilon",
+        "direction_by_importance",
         "merge_ratio",
         "merge_layers",
         "actual_merge_ratio",
@@ -426,11 +464,88 @@ def write_jsonl(rows, path):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def tensor_value(tensor, batch_idx, item_idx):
+    if tensor is None:
+        return None
+    value = tensor[batch_idx, item_idx]
+    if value.dtype.is_floating_point:
+        return float(value.detach().cpu().item())
+    return int(value.detach().cpu().item())
+
+
+def decision_dump_rows(config_name, sample_idx, repeat_idx, merge_ratio, info):
+    dump = (info or {}).get("decision_dump")
+    if not dump:
+        return []
+    cell_id = dump.get("cell_id")
+    if cell_id is None:
+        return []
+    rows = []
+    batch_size, count = cell_id.shape
+    layer = int(info.get("layer", -1))
+    strategy = str(info.get("strategy", ""))
+    method = str(info.get("method", ""))
+    for batch_idx in range(batch_size):
+        for item_idx in range(count):
+            rows.append(
+                {
+                    "config": config_name,
+                    "sample": int(sample_idx),
+                    "repeat": int(repeat_idx),
+                    "merge_ratio": float(merge_ratio),
+                    "batch": int(batch_idx),
+                    "layer": layer,
+                    "method": method,
+                    "strategy": strategy,
+                    "cell_id": tensor_value(cell_id, batch_idx, item_idx),
+                    "time_id": tensor_value(dump.get("time_id"), batch_idx, item_idx),
+                    "cell_h": tensor_value(dump.get("cell_h"), batch_idx, item_idx),
+                    "cell_w": tensor_value(dump.get("cell_w"), batch_idx, item_idx),
+                    "source_pos": tensor_value(dump.get("source_pos"), batch_idx, item_idx),
+                    "receiver_pos": tensor_value(dump.get("receiver_pos"), batch_idx, item_idx),
+                    "source_token_id": tensor_value(dump.get("source_token_id"), batch_idx, item_idx),
+                    "receiver_token_id": tensor_value(dump.get("receiver_token_id"), batch_idx, item_idx),
+                    "source_local_id": tensor_value(dump.get("source_local_id"), batch_idx, item_idx),
+                    "receiver_local_id": tensor_value(dump.get("receiver_local_id"), batch_idx, item_idx),
+                    "selected_similarity": tensor_value(
+                        dump.get("selected_similarity"), batch_idx, item_idx
+                    ),
+                    "best_similarity": tensor_value(
+                        dump.get("best_similarity"), batch_idx, item_idx
+                    ),
+                    "second_best_similarity": tensor_value(
+                        dump.get("second_best_similarity"), batch_idx, item_idx
+                    ),
+                    "source_importance": tensor_value(
+                        dump.get("source_importance"), batch_idx, item_idx
+                    ),
+                    "receiver_importance": tensor_value(
+                        dump.get("receiver_importance"), batch_idx, item_idx
+                    ),
+                }
+            )
+    return rows
+
+
+def strip_decision_dump(info):
+    if not isinstance(info, dict):
+        return info
+    return {key: value for key, value in info.items() if key != "decision_dump"}
+
+
+def strip_decision_dumps(infos):
+    return [strip_decision_dump(item) for item in (infos or [])]
+
+
 def method_name_for_strategy(strategy):
     if strategy == "local_2x2_importance_protected_vec":
         return "B_importance_protected"
     if strategy == "local_2x2_hybrid_score_vec":
         return "C_hybrid_similarity_importance"
+    if strategy == "local_keep_then_merge_vec":
+        return "B2_keep_then_merge"
+    if strategy == "local_2x2_similarity_gated_importance_vec":
+        return "C2_similarity_gated_importance"
     return "A_similarity_only"
 
 
@@ -441,6 +556,8 @@ def strategy_label(strategy):
         "local_2x2_same_time_vec": "same_time_vec",
         "local_2x2_importance_protected_vec": "protect_vec",
         "local_2x2_hybrid_score_vec": "hybrid_vec",
+        "local_keep_then_merge_vec": "keep_then_merge_vec",
+        "local_2x2_similarity_gated_importance_vec": "similarity_gated_vec",
     }
     return mapping.get(str(strategy), str(strategy).replace("/", "_"))
 
@@ -456,6 +573,16 @@ def make_config_name(args, merge_layers, ratio):
     if method.startswith("B_"):
         return (
             f"B_protect_{args.importance_source}_{args.protect_mode}_"
+            f"l{layers}_r{float(ratio):g}_{args.img_size}"
+        )
+    if method.startswith("B2_"):
+        return (
+            f"B2_keep_{args.keep_source}_{args.receiver_search}_"
+            f"l{layers}_r{float(ratio):g}_{args.img_size}"
+        )
+    if method.startswith("C2_"):
+        return (
+            f"C2_gated_{args.importance_source}_eps{float(args.similarity_gate_epsilon):g}_"
             f"l{layers}_r{float(ratio):g}_{args.img_size}"
         )
     return (
@@ -482,6 +609,12 @@ def experiment_fields(args, info=None):
         "score_delta": float(args.score_delta),
         "lambda_norm": float(args.lambda_norm),
         "lambda_motion": float(args.lambda_motion),
+        "keep_source": str(args.keep_source),
+        "receiver_search": str(args.receiver_search),
+        "keep_score_alpha": float(args.keep_score_alpha),
+        "keep_score_beta": float(args.keep_score_beta),
+        "similarity_gate_epsilon": float(args.similarity_gate_epsilon),
+        "direction_by_importance": bool(args.direction_by_importance),
     }
 
 
@@ -569,6 +702,7 @@ def main():
     baseline_latencies = []
     baseline_memories = []
     per_run_rows = []
+    decision_rows = []
     print("[RUN] baseline full encoder pipeline", flush=True)
     for sample_idx, video in enumerate(videos):
         for _ in range(max(0, int(args.warmup))):
@@ -609,9 +743,14 @@ def main():
                     "latency_ms": float(elapsed_ms),
                     "peak_memory_mb": float(peak_mb) if peak_mb is not None else None,
                     "profile": profile,
-                    "merge_info": infos,
+                    "merge_info": strip_decision_dumps(infos),
                 }
             )
+            if bool(args.dump_merge_decisions):
+                for info in infos:
+                    decision_rows.extend(
+                        decision_dump_rows("baseline", sample_idx, repeat_idx, 0.0, info)
+                    )
         profile_summary = summarize_profile(profiles)
         baseline_outputs.append(outputs[-1])
         row = {
@@ -631,6 +770,12 @@ def main():
                 "score_delta": "",
                 "lambda_norm": "",
                 "lambda_motion": "",
+                "keep_source": "",
+                "receiver_search": "",
+                "keep_score_alpha": "",
+                "keep_score_beta": "",
+                "similarity_gate_epsilon": "",
+                "direction_by_importance": "",
                 "actual_merge_ratio": 0.0,
             },
             "merge_ratio": 0.0,
@@ -721,9 +866,14 @@ def main():
                         "latency_ms": float(elapsed_ms),
                         "peak_memory_mb": float(peak_mb) if peak_mb is not None else None,
                         "profile": profile,
-                        "merge_info": infos,
+                        "merge_info": strip_decision_dumps(infos),
                     }
                 )
+                if bool(args.dump_merge_decisions):
+                    for info in infos:
+                        decision_rows.extend(
+                            decision_dump_rows(config_name, sample_idx, repeat_idx, ratio, info)
+                        )
             profile_summary = summarize_profile(profiles)
             y = baseline_outputs[sample_idx]
             y_merge = outputs[-1]
@@ -731,7 +881,7 @@ def main():
             diff = y - y_merge
             token_error = diff.norm(dim=-1).reshape(-1)
             rel_l2 = float(diff.norm().item() / y.norm().clamp_min(1e-12).item())
-            info = infos_last[-1] if infos_last else {}
+            info = strip_decision_dump(infos_last[-1]) if infos_last else {}
             fallback_reasons = [
                 str(item.get("fallback_reason"))
                 for item in infos_last
@@ -782,7 +932,7 @@ def main():
                 "any_fallback": bool(fallback_reasons),
                 "fallback_reasons": ";".join(fallback_reasons),
                 "final_merge_info": info,
-                "merge_info": infos_last,
+                "merge_info": strip_decision_dumps(infos_last),
                 "latency": summarize_times(latencies),
                 "profile": profile_summary,
             }
@@ -853,6 +1003,7 @@ def main():
             "Compares no-merge baseline with encoder-side local token merge.",
             "dynamic_ratio_mode, score_delta, and debug_dump_scores are metadata-only in this implementation.",
             "Use final_implementation and any_fallback fields to distinguish vectorized runs from Python fallback.",
+            "Decision dumps are optional debug artifacts and are written outside the encoder hot path.",
         ],
         "input": {
             "num_samples": len(samples),
@@ -879,12 +1030,22 @@ def main():
             "score_delta": float(args.score_delta),
             "lambda_norm": float(args.lambda_norm),
             "lambda_motion": float(args.lambda_motion),
+            "dump_merge_decisions": bool(args.dump_merge_decisions),
+            "max_decision_dump": int(args.max_decision_dump),
+            "keep_source": str(args.keep_source),
+            "receiver_search": str(args.receiver_search),
+            "keep_score_alpha": float(args.keep_score_alpha),
+            "keep_score_beta": float(args.keep_score_beta),
+            "similarity_gate_epsilon": float(args.similarity_gate_epsilon),
+            "direction_by_importance": bool(args.direction_by_importance),
         },
         "baseline": baseline_summary,
         "configs": [{"config": "baseline", **baseline_summary}] + config_summaries,
     }
     write_csv(all_rows, out_dir)
     write_jsonl(per_run_rows, out_dir / "per_run_profile.jsonl")
+    if decision_rows:
+        write_jsonl(decision_rows, out_dir / "merge_decisions.jsonl")
     write_plots(summary, out_dir)
     with (out_dir / "full_pipeline_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)

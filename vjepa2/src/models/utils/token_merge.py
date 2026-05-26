@@ -27,6 +27,14 @@ class MergeConfig:
     lambda_norm: float = 0.3
     lambda_motion: float = 0.7
     debug_dump_scores: bool = False
+    dump_merge_decisions: bool = False
+    max_decision_dump: int = 8192
+    keep_source: str = "redundancy"
+    receiver_search: str = "cell"
+    keep_score_alpha: float = 1.0
+    keep_score_beta: float = 0.0
+    similarity_gate_epsilon: float = 0.01
+    direction_by_importance: bool = True
 
 
 def normalize_merge_config(config):
@@ -46,6 +54,8 @@ def normalize_merge_config(config):
         "local_2x2_same_time_vec",
         "local_2x2_importance_protected_vec",
         "local_2x2_hybrid_score_vec",
+        "local_keep_then_merge_vec",
+        "local_2x2_similarity_gated_importance_vec",
     )
     if strategy in vectorized_strategies and len(layers) > 1:
         raise ValueError(
@@ -57,10 +67,17 @@ def normalize_merge_config(config):
     if strategy in (
         "local_2x2_importance_protected_vec",
         "local_2x2_hybrid_score_vec",
+        "local_2x2_similarity_gated_importance_vec",
     ) and importance_source == "none":
         raise ValueError(
             f"{strategy} requires importance_source != 'none'. "
             "Use norm, motion, norm_motion, or qk_global_hidden."
+        )
+    keep_source = str(config.get("keep_source", "redundancy"))
+    if strategy == "local_keep_then_merge_vec" and "importance" in keep_source and importance_source == "none":
+        raise ValueError(
+            "local_keep_then_merge_vec with an importance-based keep_source requires "
+            "importance_source != 'none'."
         )
     normalized = MergeConfig(
         enabled=bool(config.get("enabled", False)),
@@ -82,6 +99,14 @@ def normalize_merge_config(config):
         lambda_norm=float(config.get("lambda_norm", 0.3)),
         lambda_motion=float(config.get("lambda_motion", 0.7)),
         debug_dump_scores=bool(config.get("debug_dump_scores", False)),
+        dump_merge_decisions=bool(config.get("dump_merge_decisions", False)),
+        max_decision_dump=int(config.get("max_decision_dump", 8192)),
+        keep_source=keep_source,
+        receiver_search=str(config.get("receiver_search", "cell")),
+        keep_score_alpha=float(config.get("keep_score_alpha", 1.0)),
+        keep_score_beta=float(config.get("keep_score_beta", 0.0)),
+        similarity_gate_epsilon=float(config.get("similarity_gate_epsilon", 0.01)),
+        direction_by_importance=bool(config.get("direction_by_importance", True)),
     )
     _validate_merge_config(normalized)
     return normalized
@@ -91,11 +116,25 @@ def _validate_merge_config(config):
     if config.strategy in (
         "local_2x2_importance_protected_vec",
         "local_2x2_hybrid_score_vec",
+        "local_2x2_similarity_gated_importance_vec",
     ) and config.importance_source == "none":
         raise ValueError(
             f"{config.strategy} requires importance_source != 'none'. "
             "Use norm, motion, norm_motion, or qk_global_hidden."
         )
+    if config.strategy == "local_keep_then_merge_vec":
+        if config.receiver_search != "cell":
+            raise ValueError("local_keep_then_merge_vec currently supports receiver_search='cell'")
+        if config.keep_source not in ("redundancy", "importance", "importance_redundancy", "random"):
+            raise ValueError(
+                "keep_source must be one of redundancy|importance|importance_redundancy|random, "
+                f"got {config.keep_source!r}"
+            )
+        if "importance" in config.keep_source and config.importance_source == "none":
+            raise ValueError(
+                "local_keep_then_merge_vec with an importance-based keep_source requires "
+                "importance_source != 'none'."
+            )
 
 
 def _normalize_per_sample(score, eps=1e-6):
@@ -218,6 +257,8 @@ class LocalTokenMerger(nn.Module):
             "local_2x2_same_time_vec",
             "local_2x2_importance_protected_vec",
             "local_2x2_hybrid_score_vec",
+            "local_keep_then_merge_vec",
+            "local_2x2_similarity_gated_importance_vec",
         )
         if self.config.strategy not in vectorized_strategies:
             raise ValueError(f"Unsupported merge strategy: {self.config.strategy}")
@@ -251,6 +292,8 @@ class LocalTokenMerger(nn.Module):
             if self.config.strategy in (
                 "local_2x2_importance_protected_vec",
                 "local_2x2_hybrid_score_vec",
+                "local_keep_then_merge_vec",
+                "local_2x2_similarity_gated_importance_vec",
             ):
                 raise RuntimeError(
                     f"{self.config.strategy} cannot fall back to the Python similarity path "
@@ -443,6 +486,31 @@ class LocalTokenMerger(nn.Module):
                     target_merges,
                 )
             )
+        elif self.config.strategy == "local_keep_then_merge_vec":
+            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
+                self._select_keep_then_merge_pairs(
+                    similarities,
+                    flat_cell_positions,
+                    pair_left,
+                    pair_right,
+                    importance_cells,
+                    protected_cells,
+                    target_merges,
+                )
+            )
+        elif self.config.strategy == "local_2x2_similarity_gated_importance_vec":
+            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
+                self._select_similarity_gated_importance_pairs(
+                    similarities,
+                    flat_cell_positions,
+                    pair_left,
+                    pair_right,
+                    norm_cells,
+                    importance_cells,
+                    protected_cells,
+                    target_merges,
+                )
+            )
         else:
             source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
                 self._select_similarity_pairs(
@@ -518,6 +586,18 @@ class LocalTokenMerger(nn.Module):
             num_candidates=candidate_count,
             num_candidate_cells=candidate_cell_count,
             num_accepted=num_accepted,
+            decision_dump=self._build_decision_dump(
+                source_pos,
+                receiver_pos,
+                selected_scores,
+                similarities,
+                flat_cell_positions,
+                token_ids,
+                importance,
+                t_grid,
+                h_cells,
+                w_cells,
+            ),
         )
         return x_new, ids_new, size_new, rep_new, info
 
@@ -658,6 +738,222 @@ class LocalTokenMerger(nn.Module):
         selected_cos = selected_directed_cos.gather(2, selected_dir_index.unsqueeze(-1)).squeeze(-1)
         return source_pos, receiver_pos, selected_cos, num_accepted, candidate_count, candidate_cell_count
 
+    def _local_similarity_matrix(self, similarities, pair_left, pair_right):
+        batch_size, num_cells = similarities.shape[:2]
+        sim_matrix = torch.full(
+            (batch_size, num_cells, 4, 4),
+            -torch.inf,
+            device=similarities.device,
+            dtype=similarities.dtype,
+        )
+        sim_matrix[:, :, pair_left, pair_right] = similarities
+        sim_matrix[:, :, pair_right, pair_left] = similarities
+        return sim_matrix
+
+    def _select_keep_then_merge_pairs(
+        self,
+        similarities,
+        flat_cell_positions,
+        pair_left,
+        pair_right,
+        importance_cells,
+        protected_cells,
+        target_merges,
+    ):
+        sim_matrix = self._local_similarity_matrix(similarities, pair_left, pair_right)
+        redundancy = sim_matrix.max(dim=-1).values
+        novelty = 1.0 - redundancy
+        keep_source = str(self.config.keep_source)
+        if keep_source == "redundancy":
+            keep_score = novelty
+        elif keep_source == "importance":
+            keep_score = importance_cells
+        elif keep_source == "importance_redundancy":
+            keep_score = (
+                float(self.config.keep_score_alpha) * novelty
+                + float(self.config.keep_score_beta) * importance_cells
+            )
+        elif keep_source == "random":
+            keep_score = torch.rand_like(novelty)
+        else:
+            raise ValueError(f"Unsupported keep_source: {keep_source}")
+
+        source_local = keep_score.argmin(dim=-1)
+        source_protected = protected_cells.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
+        sim_to_receiver = sim_matrix.gather(
+            2, source_local.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 4)
+        ).squeeze(2)
+        local_index = torch.arange(4, device=similarities.device, dtype=torch.long)
+        valid_receiver = local_index.view(1, 1, 4) != source_local.unsqueeze(-1)
+        sim_to_receiver = sim_to_receiver.masked_fill(~valid_receiver, -torch.inf)
+        best_receiver_sim, receiver_local = sim_to_receiver.max(dim=-1)
+
+        valid = ~source_protected & torch.isfinite(best_receiver_sim)
+        if float(self.config.similarity_threshold) >= 0.0:
+            valid = valid & (best_receiver_sim >= float(self.config.similarity_threshold))
+
+        num_accepted = self._candidate_target_merges(valid, target_merges)
+        candidate_count = int(valid.sum().item())
+        candidate_cell_count = self._candidate_cell_count(valid)
+        if num_accepted <= 0:
+            empty = torch.empty(similarities.shape[0], 0, device=similarities.device, dtype=torch.long)
+            return empty, empty, torch.empty_like(empty, dtype=similarities.dtype), 0, candidate_count, candidate_cell_count
+
+        cell_score = best_receiver_sim.masked_fill(~valid, -torch.inf)
+        selected_scores, selected_cells = cell_score.topk(num_accepted, dim=1)
+        if not bool(torch.isfinite(selected_scores).all().item()):
+            raise RuntimeError("Invalid keep-then-merge selection produced non-finite scores")
+        selected_positions = flat_cell_positions[selected_cells]
+        source_local = source_local.gather(1, selected_cells)
+        receiver_local = receiver_local.gather(1, selected_cells)
+        source_pos = selected_positions.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
+        receiver_pos = selected_positions.gather(2, receiver_local.unsqueeze(-1)).squeeze(-1)
+        return source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count
+
+    def _select_similarity_gated_importance_pairs(
+        self,
+        similarities,
+        flat_cell_positions,
+        pair_left,
+        pair_right,
+        norm_cells,
+        importance_cells,
+        protected_cells,
+        target_merges,
+    ):
+        left_importance = importance_cells[:, :, pair_left]
+        right_importance = importance_cells[:, :, pair_right]
+        left_norm = norm_cells[:, :, pair_left]
+        right_norm = norm_cells[:, :, pair_right]
+        if bool(self.config.direction_by_importance):
+            left_is_receiver = torch.where(
+                left_importance == right_importance,
+                left_norm >= right_norm,
+                left_importance >= right_importance,
+            )
+        elif self.config.receiver == "max_norm":
+            left_is_receiver = left_norm >= right_norm
+        else:
+            left_is_receiver = torch.ones_like(similarities, dtype=torch.bool)
+
+        source_local_all = torch.where(left_is_receiver, pair_right, pair_left)
+        receiver_local_all = torch.where(left_is_receiver, pair_left, pair_right)
+        best_sim = similarities.max(dim=-1, keepdim=True).values
+        epsilon = max(0.0, float(self.config.similarity_gate_epsilon))
+        valid = similarities >= (best_sim - epsilon)
+        source_protected = protected_cells.gather(2, source_local_all)
+        valid = valid & ~source_protected
+        if float(self.config.similarity_threshold) >= 0.0:
+            valid = valid & (similarities >= float(self.config.similarity_threshold))
+
+        num_accepted = self._candidate_target_merges(valid, target_merges)
+        candidate_count = int(valid.sum().item())
+        candidate_cell_count = self._candidate_cell_count(valid)
+        if num_accepted <= 0:
+            empty = torch.empty(similarities.shape[0], 0, device=similarities.device, dtype=torch.long)
+            return empty, empty, torch.empty_like(empty, dtype=similarities.dtype), 0, candidate_count, candidate_cell_count
+
+        importance_gap = (left_importance - right_importance).abs()
+        tie_weight = float(self.config.score_beta) * max(epsilon, 1e-6)
+        score = similarities + tie_weight * importance_gap
+        score = score.masked_fill(~valid, -torch.inf)
+        best_score, best_pair_index = score.max(dim=-1)
+        selected_scores_for_cells, selected_cells = best_score.topk(num_accepted, dim=1)
+        if not bool(torch.isfinite(selected_scores_for_cells).all().item()):
+            raise RuntimeError("Invalid similarity-gated selection produced non-finite scores")
+        selected_pair_index = best_pair_index.gather(1, selected_cells)
+        source_local = source_local_all.gather(
+            1, selected_cells.unsqueeze(-1).expand(-1, -1, 6)
+        )
+        receiver_local = receiver_local_all.gather(
+            1, selected_cells.unsqueeze(-1).expand(-1, -1, 6)
+        )
+        source_local = source_local.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
+        receiver_local = receiver_local.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
+        selected_positions = flat_cell_positions[selected_cells]
+        source_pos = selected_positions.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
+        receiver_pos = selected_positions.gather(2, receiver_local.unsqueeze(-1)).squeeze(-1)
+        selected_similarities = similarities.gather(
+            1, selected_cells.unsqueeze(-1).expand(-1, -1, similarities.shape[-1])
+        )
+        selected_cos = selected_similarities.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
+        return source_pos, receiver_pos, selected_cos, num_accepted, candidate_count, candidate_cell_count
+
+    def _build_decision_dump(
+        self,
+        source_pos,
+        receiver_pos,
+        selected_scores,
+        similarities,
+        flat_cell_positions,
+        token_ids,
+        importance,
+        t_grid,
+        h_cells,
+        w_cells,
+    ):
+        if not bool(self.config.dump_merge_decisions) or source_pos.numel() == 0:
+            return None
+
+        max_items = max(0, int(self.config.max_decision_dump))
+        if max_items == 0:
+            return None
+        limit = min(max_items, source_pos.shape[1])
+        source_pos = source_pos[:, :limit]
+        receiver_pos = receiver_pos[:, :limit]
+        selected_scores = selected_scores[:, :limit]
+
+        tokens_per_frame = int(h_cells * 2 * w_cells * 2)
+        source_t = source_pos // tokens_per_frame
+        source_rem = source_pos - source_t * tokens_per_frame
+        source_h = source_rem // int(w_cells * 2)
+        source_w = source_rem - source_h * int(w_cells * 2)
+        receiver_t = receiver_pos // tokens_per_frame
+        receiver_rem = receiver_pos - receiver_t * tokens_per_frame
+        receiver_h = receiver_rem // int(w_cells * 2)
+        receiver_w = receiver_rem - receiver_h * int(w_cells * 2)
+        cell_h = source_h // 2
+        cell_w = source_w // 2
+        cell_id = source_t * int(h_cells * w_cells) + cell_h * int(w_cells) + cell_w
+        source_local = (source_h % 2) * 2 + (source_w % 2)
+        receiver_local = (receiver_h % 2) * 2 + (receiver_w % 2)
+
+        selected_cell_sims = similarities.gather(
+            1, cell_id.unsqueeze(-1).expand(-1, -1, similarities.shape[-1])
+        )
+        best_two = selected_cell_sims.topk(k=2, dim=-1).values
+        best_similarity = best_two[:, :, 0]
+        second_best_similarity = best_two[:, :, 1]
+
+        source_token_id = token_ids.gather(1, source_pos)
+        receiver_token_id = token_ids.gather(1, receiver_pos)
+        source_importance = None
+        receiver_importance = None
+        if importance is not None:
+            source_importance = importance.gather(1, source_pos)
+            receiver_importance = importance.gather(1, receiver_pos)
+
+        return {
+            "strategy": self.config.strategy,
+            "cell_id": cell_id.detach(),
+            "time_id": source_t.detach(),
+            "cell_h": cell_h.detach(),
+            "cell_w": cell_w.detach(),
+            "source_pos": source_pos.detach(),
+            "receiver_pos": receiver_pos.detach(),
+            "source_token_id": source_token_id.detach(),
+            "receiver_token_id": receiver_token_id.detach(),
+            "source_local_id": source_local.detach(),
+            "receiver_local_id": receiver_local.detach(),
+            "selected_similarity": selected_scores.detach(),
+            "best_similarity": best_similarity.detach(),
+            "second_best_similarity": second_best_similarity.detach(),
+            "source_importance": source_importance.detach() if source_importance is not None else None,
+            "receiver_importance": receiver_importance.detach() if receiver_importance is not None else None,
+            "num_dumped_per_batch": int(limit),
+            "num_selected_per_batch": int(source_pos.shape[1]),
+        }
+
     def _reshape_2x2_cells(self, tensor, batch_size, t_grid, h_cells, w_cells, dim):
         return (
             tensor.reshape(batch_size, t_grid, h_cells, 2, w_cells, 2, dim)
@@ -749,6 +1045,7 @@ class LocalTokenMerger(nn.Module):
         num_candidates=None,
         num_candidate_cells=None,
         num_accepted=None,
+        decision_dump=None,
     ):
         before = int(x_before.shape[1])
         after = int(x_after.shape[1])
@@ -758,6 +1055,10 @@ class LocalTokenMerger(nn.Module):
             method = "B_importance_protected"
         elif self.config.strategy == "local_2x2_hybrid_score_vec":
             method = "C_hybrid_similarity_importance"
+        elif self.config.strategy == "local_keep_then_merge_vec":
+            method = "B2_keep_then_merge"
+        elif self.config.strategy == "local_2x2_similarity_gated_importance_vec":
+            method = "C2_similarity_gated_importance"
         elif self.config.merge_ratio <= 0 and self.config.importance_source != "none":
             method = "importance_diagnostic"
         info = {
@@ -775,6 +1076,14 @@ class LocalTokenMerger(nn.Module):
             "score_delta": float(self.config.score_delta),
             "lambda_norm": float(self.config.lambda_norm),
             "lambda_motion": float(self.config.lambda_motion),
+            "dump_merge_decisions": bool(self.config.dump_merge_decisions),
+            "max_decision_dump": int(self.config.max_decision_dump),
+            "keep_source": self.config.keep_source,
+            "receiver_search": self.config.receiver_search,
+            "keep_score_alpha": float(self.config.keep_score_alpha),
+            "keep_score_beta": float(self.config.keep_score_beta),
+            "similarity_gate_epsilon": float(self.config.similarity_gate_epsilon),
+            "direction_by_importance": bool(self.config.direction_by_importance),
             "num_tokens_before": before,
             "num_tokens_after": after,
             "num_merged_min_batch": int(min_merged),
@@ -800,6 +1109,8 @@ class LocalTokenMerger(nn.Module):
             info["implementation"] = implementation
         if fallback_reason is not None:
             info["fallback_reason"] = fallback_reason
+        if decision_dump is not None:
+            info["decision_dump"] = decision_dump
 
         if importance is not None:
             score = importance.detach().float()

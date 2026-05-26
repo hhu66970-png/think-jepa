@@ -595,6 +595,16 @@ def build_dense_jepa_merge_config(args):
         "score_delta": float(getattr(args, "dense_jepa_score_delta", 0.0)),
         "lambda_norm": float(getattr(args, "dense_jepa_lambda_norm", 0.3)),
         "lambda_motion": float(getattr(args, "dense_jepa_lambda_motion", 0.7)),
+        "keep_source": str(getattr(args, "dense_jepa_keep_source", "redundancy")),
+        "receiver_search": str(getattr(args, "dense_jepa_receiver_search", "cell")),
+        "keep_score_alpha": float(getattr(args, "dense_jepa_keep_score_alpha", 1.0)),
+        "keep_score_beta": float(getattr(args, "dense_jepa_keep_score_beta", 0.0)),
+        "similarity_gate_epsilon": float(
+            getattr(args, "dense_jepa_similarity_gate_epsilon", 0.01)
+        ),
+        "direction_by_importance": bool(
+            getattr(args, "dense_jepa_direction_by_importance", True)
+        ),
     }
 
 
@@ -3733,12 +3743,33 @@ if __name__ == "__main__":
     parser.add_argument("--dense_jepa_lambda_norm", type=float, default=0.3)
     parser.add_argument("--dense_jepa_lambda_motion", type=float, default=0.7)
     parser.add_argument(
+        "--dense_jepa_keep_source",
+        type=str,
+        default="redundancy",
+        help="B2 keep score source: redundancy, importance, importance_redundancy, or random",
+    )
+    parser.add_argument(
+        "--dense_jepa_receiver_search",
+        type=str,
+        default="cell",
+        help="B2 receiver search scope; currently only cell is implemented",
+    )
+    parser.add_argument("--dense_jepa_keep_score_alpha", type=float, default=1.0)
+    parser.add_argument("--dense_jepa_keep_score_beta", type=float, default=0.0)
+    parser.add_argument("--dense_jepa_similarity_gate_epsilon", type=float, default=0.01)
+    parser.add_argument(
+        "--no_dense_jepa_direction_by_importance",
+        dest="dense_jepa_direction_by_importance",
+        action="store_false",
+        help="for C2, keep receiver direction independent of importance",
+    )
+    parser.add_argument(
         "--no_dense_jepa_restore_dense",
         dest="dense_jepa_restore_dense",
         action="store_false",
         help="return compressed encoder tokens instead of restoring to the dense grid",
     )
-    parser.set_defaults(dense_jepa_restore_dense=True)
+    parser.set_defaults(dense_jepa_restore_dense=True, dense_jepa_direction_by_importance=True)
     # Optional sharding
     parser.add_argument("--shards", type=int, default=None, help="total number of data shards")
     parser.add_argument("--shards_id", type=int, default=0, help="current shard id")
