@@ -15,12 +15,25 @@ class MergeConfig:
     receiver: str = "max_norm"
     restore_dense: bool = True
     profile: bool = False
+    importance_source: str = "none"
+    protect_mode: str = "none"
+    protect_ratio: float = 0.0
+    similarity_threshold: float = -1.0
+    dynamic_ratio_mode: str = "none"
+    score_alpha: float = 1.0
+    score_beta: float = 0.3
+    score_gamma: float = 0.5
+    score_delta: float = 0.0
+    lambda_norm: float = 0.3
+    lambda_motion: float = 0.7
+    debug_dump_scores: bool = False
 
 
 def normalize_merge_config(config):
     if config is None:
         return MergeConfig()
     if isinstance(config, MergeConfig):
+        _validate_merge_config(config)
         return config
     if not isinstance(config, dict):
         raise TypeError(f"merge_config must be a dict or MergeConfig, got {type(config)!r}")
@@ -29,13 +42,27 @@ def normalize_merge_config(config):
         layers = tuple(int(item) for item in layers.split(",") if item.strip())
     strategy = str(config.get("strategy", "local_2x2_same_time"))
     layers = tuple(int(item) for item in layers)
-    if strategy == "local_2x2_same_time_vec" and len(layers) > 1:
+    vectorized_strategies = (
+        "local_2x2_same_time_vec",
+        "local_2x2_importance_protected_vec",
+        "local_2x2_hybrid_score_vec",
+    )
+    if strategy in vectorized_strategies and len(layers) > 1:
         raise ValueError(
-            "local_2x2_same_time_vec currently supports exactly one merge layer. "
+            f"{strategy} currently supports exactly one merge layer. "
             "Use a single layer or implement sparse-state vectorized merging before "
             "enabling multi-layer vectorized merge."
         )
-    return MergeConfig(
+    importance_source = str(config.get("importance_source", "none"))
+    if strategy in (
+        "local_2x2_importance_protected_vec",
+        "local_2x2_hybrid_score_vec",
+    ) and importance_source == "none":
+        raise ValueError(
+            f"{strategy} requires importance_source != 'none'. "
+            "Use norm, motion, norm_motion, or qk_global_hidden."
+        )
+    normalized = MergeConfig(
         enabled=bool(config.get("enabled", False)),
         merge_layers=layers,
         merge_ratio=float(config.get("merge_ratio", 0.0)),
@@ -43,6 +70,96 @@ def normalize_merge_config(config):
         receiver=str(config.get("receiver", "max_norm")),
         restore_dense=bool(config.get("restore_dense", True)),
         profile=bool(config.get("profile", False)),
+        importance_source=importance_source,
+        protect_mode=str(config.get("protect_mode", "none")),
+        protect_ratio=float(config.get("protect_ratio", 0.0)),
+        similarity_threshold=float(config.get("similarity_threshold", -1.0)),
+        dynamic_ratio_mode=str(config.get("dynamic_ratio_mode", "none")),
+        score_alpha=float(config.get("score_alpha", 1.0)),
+        score_beta=float(config.get("score_beta", 0.3)),
+        score_gamma=float(config.get("score_gamma", 0.5)),
+        score_delta=float(config.get("score_delta", 0.0)),
+        lambda_norm=float(config.get("lambda_norm", 0.3)),
+        lambda_motion=float(config.get("lambda_motion", 0.7)),
+        debug_dump_scores=bool(config.get("debug_dump_scores", False)),
+    )
+    _validate_merge_config(normalized)
+    return normalized
+
+
+def _validate_merge_config(config):
+    if config.strategy in (
+        "local_2x2_importance_protected_vec",
+        "local_2x2_hybrid_score_vec",
+    ) and config.importance_source == "none":
+        raise ValueError(
+            f"{config.strategy} requires importance_source != 'none'. "
+            "Use norm, motion, norm_motion, or qk_global_hidden."
+        )
+
+
+def _normalize_per_sample(score, eps=1e-6):
+    score = score.float()
+    min_val = score.amin(dim=1, keepdim=True)
+    max_val = score.amax(dim=1, keepdim=True)
+    return (score - min_val) / (max_val - min_val + eps)
+
+
+def compute_importance(
+    x,
+    t_grid,
+    h_grid,
+    w_grid,
+    source: str,
+    lambda_norm: float = 0.3,
+    lambda_motion: float = 0.7,
+    eps: float = 1e-6,
+):
+    """Return per-token importance [B, N] for dense video patch tokens."""
+    source = str(source or "none")
+    if source == "none":
+        return None
+
+    batch_size, num_tokens, dim = x.shape
+    expected = int(t_grid * h_grid * w_grid)
+    if num_tokens != expected:
+        raise ValueError(
+            f"importance_source={source} requires dense tokens, got {num_tokens} vs {expected}"
+        )
+
+    x_float = x.float()
+    norm_importance = _normalize_per_sample(torch.linalg.norm(x_float, dim=-1), eps=eps)
+
+    if source == "norm":
+        return norm_importance
+
+    if source in ("motion", "norm_motion"):
+        x_grid = x_float.reshape(batch_size, int(t_grid), int(h_grid), int(w_grid), dim)
+        motion = torch.zeros(
+            batch_size,
+            int(t_grid),
+            int(h_grid),
+            int(w_grid),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        if int(t_grid) > 1:
+            motion[:, 1:] = torch.linalg.norm(x_grid[:, 1:] - x_grid[:, :-1], dim=-1)
+        motion_importance = _normalize_per_sample(motion.reshape(batch_size, num_tokens), eps=eps)
+        if source == "motion":
+            return motion_importance
+        mixed = float(lambda_norm) * norm_importance + float(lambda_motion) * motion_importance
+        return _normalize_per_sample(mixed, eps=eps)
+
+    if source == "qk_global_hidden":
+        x_norm = F.normalize(x_float, dim=-1, eps=eps)
+        global_query = F.normalize(x_norm.mean(dim=1, keepdim=True), dim=-1, eps=eps)
+        score = (x_norm * global_query).sum(dim=-1)
+        return _normalize_per_sample(score, eps=eps)
+
+    raise ValueError(
+        "importance_source must be one of none|norm|motion|norm_motion|qk_global_hidden, "
+        f"got {source!r}"
     )
 
 
@@ -97,18 +214,48 @@ class LocalTokenMerger(nn.Module):
                 w_grid,
                 implementation="python",
             )
-        if self.config.strategy != "local_2x2_same_time_vec":
+        vectorized_strategies = (
+            "local_2x2_same_time_vec",
+            "local_2x2_importance_protected_vec",
+            "local_2x2_hybrid_score_vec",
+        )
+        if self.config.strategy not in vectorized_strategies:
             raise ValueError(f"Unsupported merge strategy: {self.config.strategy}")
 
         if self.config.merge_ratio <= 0.0:
+            importance = None
+            if self.config.importance_source != "none":
+                importance = compute_importance(
+                    x,
+                    int(t_grid),
+                    int(h_grid),
+                    int(w_grid),
+                    self.config.importance_source,
+                    lambda_norm=self.config.lambda_norm,
+                    lambda_motion=self.config.lambda_motion,
+                )
             return x, token_ids, token_size, rep_for_orig, self._info(
-                x, x, 0, 0, implementation="vectorized"
+                x,
+                x,
+                0,
+                0,
+                implementation="vectorized",
+                importance=importance,
+                protected_mask=None,
             )
 
         can_vectorize, fallback_reason = self._can_vectorize_dense_grid(
             x, token_ids, rep_for_orig, int(t_grid), int(h_grid), int(w_grid)
         )
         if not can_vectorize:
+            if self.config.strategy in (
+                "local_2x2_importance_protected_vec",
+                "local_2x2_hybrid_score_vec",
+            ):
+                raise RuntimeError(
+                    f"{self.config.strategy} cannot fall back to the Python similarity path "
+                    f"because that would drop importance/protection semantics: {fallback_reason}"
+                )
             return self._forward_python(
                 x,
                 token_ids,
@@ -258,30 +405,72 @@ class LocalTokenMerger(nn.Module):
         pair_right = torch.tensor([1, 2, 3, 2, 3, 3], device=x.device, dtype=torch.long)
         x_normed = F.normalize(x_cells.float(), dim=-1, eps=1e-6)
         similarities = (x_normed[:, :, pair_left] * x_normed[:, :, pair_right]).sum(dim=-1)
-        best_scores, best_pair_index = similarities.max(dim=-1)
-        selected_scores, selected_cells = best_scores.topk(target_merges, dim=1)
-
-        selected_pair_index = best_pair_index.gather(1, selected_cells)
-        left_local = pair_left[selected_pair_index]
-        right_local = pair_right[selected_pair_index]
 
         flat_cell_positions = torch.arange(num_tokens, device=x.device, dtype=torch.long)
         flat_cell_positions = flat_cell_positions.reshape(t_grid, h_cells, 2, w_cells, 2)
         flat_cell_positions = flat_cell_positions.permute(0, 1, 3, 2, 4).reshape(num_cells, 4)
-        selected_positions = flat_cell_positions[selected_cells]
-        left_pos = selected_positions.gather(2, left_local.unsqueeze(-1)).squeeze(-1)
-        right_pos = selected_positions.gather(2, right_local.unsqueeze(-1)).squeeze(-1)
 
-        if self.config.receiver == "max_norm":
-            token_norm = torch.linalg.norm(x.float(), dim=-1)
-            left_norm = token_norm.gather(1, left_pos)
-            right_norm = token_norm.gather(1, right_pos)
-            left_is_receiver = left_norm >= right_norm
-            receiver_pos = torch.where(left_is_receiver, left_pos, right_pos)
-            source_pos = torch.where(left_is_receiver, right_pos, left_pos)
+        token_norm = torch.linalg.norm(x.float(), dim=-1)
+        norm_cells = token_norm.reshape(batch_size, num_cells, 4)
+        importance = compute_importance(
+            x,
+            t_grid,
+            h_grid,
+            w_grid,
+            self.config.importance_source,
+            lambda_norm=self.config.lambda_norm,
+            lambda_motion=self.config.lambda_motion,
+        )
+        if importance is None:
+            importance_cells = torch.zeros(
+                batch_size, num_cells, 4, device=x.device, dtype=torch.float32
+            )
         else:
-            receiver_pos = torch.minimum(left_pos, right_pos)
-            source_pos = torch.maximum(left_pos, right_pos)
+            importance_cells = importance.reshape(batch_size, num_cells, 4)
+        protected_cells = self._compute_protected_cells(
+            importance, importance_cells, flat_cell_positions
+        )
+
+        if self.config.strategy == "local_2x2_hybrid_score_vec":
+            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
+                self._select_hybrid_pairs(
+                    similarities,
+                    flat_cell_positions,
+                    pair_left,
+                    pair_right,
+                    importance_cells,
+                    protected_cells,
+                    target_merges,
+                )
+            )
+        else:
+            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
+                self._select_similarity_pairs(
+                    similarities,
+                    flat_cell_positions,
+                    pair_left,
+                    pair_right,
+                    norm_cells,
+                    importance_cells,
+                    protected_cells,
+                    target_merges,
+                )
+            )
+
+        if num_accepted <= 0:
+            return x, token_ids, token_size, rep_for_orig, self._info(
+                x,
+                x,
+                0,
+                0,
+                selected_scores=None,
+                implementation="vectorized",
+                importance=importance,
+                protected_mask=protected_cells.reshape(batch_size, -1),
+                num_candidates=candidate_count,
+                num_candidate_cells=candidate_cell_count,
+                num_accepted=0,
+            )
 
         source_ids = token_ids.gather(1, source_pos)
         receiver_ids = token_ids.gather(1, receiver_pos)
@@ -303,7 +492,7 @@ class LocalTokenMerger(nn.Module):
 
         keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
         keep.scatter_(1, source_pos, False)
-        num_after = num_tokens - target_merges
+        num_after = num_tokens - num_accepted
         x_new = x_updated[keep].reshape(batch_size, num_after, dim)
         ids_new = token_ids[keep].reshape(batch_size, num_after)
         size_new = token_size_updated[keep].reshape(batch_size, num_after)
@@ -314,12 +503,160 @@ class LocalTokenMerger(nn.Module):
         info = self._info(
             x,
             x_new,
-            target_merges,
-            target_merges,
+            num_accepted,
+            num_accepted,
             selected_scores=selected_scores,
             implementation="vectorized",
+            importance=importance,
+            protected_mask=protected_cells.reshape(batch_size, -1),
+            source_importance=(
+                importance.gather(1, source_pos) if importance is not None else None
+            ),
+            receiver_importance=(
+                importance.gather(1, receiver_pos) if importance is not None else None
+            ),
+            num_candidates=candidate_count,
+            num_candidate_cells=candidate_cell_count,
+            num_accepted=num_accepted,
         )
         return x_new, ids_new, size_new, rep_new, info
+
+    def _compute_protected_cells(self, importance, importance_cells, flat_cell_positions):
+        protected = torch.zeros_like(importance_cells, dtype=torch.bool)
+        mode = str(self.config.protect_mode or "none")
+        if mode in ("local_top1", "local_top1_global_topk"):
+            top_local = importance_cells.argmax(dim=-1, keepdim=True)
+            protected.scatter_(-1, top_local, True)
+        if mode in ("global_topk", "local_top1_global_topk") and importance is not None:
+            ratio = max(0.0, min(float(self.config.protect_ratio), 1.0))
+            k = int(math.floor(importance.shape[1] * ratio))
+            if k > 0:
+                _, top_idx = importance.topk(k, dim=1)
+                global_mask = torch.zeros_like(importance, dtype=torch.bool)
+                global_mask.scatter_(1, top_idx, True)
+                grouped_positions = flat_cell_positions.reshape(1, -1).expand(
+                    importance.shape[0], -1
+                )
+                protected_global = global_mask.gather(1, grouped_positions).reshape_as(protected)
+                protected = protected | protected_global
+        return protected
+
+    def _candidate_target_merges(self, valid, target_merges):
+        valid_cells = valid.any(dim=-1) if valid.ndim == 3 else valid
+        valid_count = valid_cells.reshape(valid_cells.shape[0], -1).sum(dim=1)
+        return int(min(target_merges, int(valid_count.min().item())))
+
+    def _candidate_cell_count(self, valid):
+        valid_cells = valid.any(dim=-1) if valid.ndim == 3 else valid
+        return int(valid_cells.sum().item())
+
+    def _select_similarity_pairs(
+        self,
+        similarities,
+        flat_cell_positions,
+        pair_left,
+        pair_right,
+        norm_cells,
+        importance_cells,
+        protected_cells,
+        target_merges,
+    ):
+        left_importance = importance_cells[:, :, pair_left]
+        right_importance = importance_cells[:, :, pair_right]
+        left_norm = norm_cells[:, :, pair_left]
+        right_norm = norm_cells[:, :, pair_right]
+
+        if self.config.strategy == "local_2x2_importance_protected_vec":
+            left_is_receiver = torch.where(
+                left_importance == right_importance,
+                left_norm >= right_norm,
+                left_importance >= right_importance,
+            )
+        elif self.config.receiver == "max_norm":
+            left_is_receiver = left_norm >= right_norm
+        else:
+            left_is_receiver = torch.ones_like(similarities, dtype=torch.bool)
+
+        source_local_all = torch.where(left_is_receiver, pair_right, pair_left)
+        receiver_local_all = torch.where(left_is_receiver, pair_left, pair_right)
+        if self.config.strategy == "local_2x2_same_time_vec":
+            valid = torch.ones_like(similarities, dtype=torch.bool)
+        else:
+            source_protected = protected_cells.gather(2, source_local_all)
+            valid = ~source_protected
+            if float(self.config.similarity_threshold) >= 0.0:
+                valid = valid & (similarities >= float(self.config.similarity_threshold))
+
+        num_accepted = self._candidate_target_merges(valid, target_merges)
+        candidate_count = int(valid.sum().item())
+        candidate_cell_count = self._candidate_cell_count(valid)
+        if num_accepted <= 0:
+            empty = torch.empty(similarities.shape[0], 0, device=similarities.device, dtype=torch.long)
+            return empty, empty, torch.empty_like(empty, dtype=similarities.dtype), 0, candidate_count, candidate_cell_count
+
+        score = similarities.masked_fill(~valid, -torch.inf)
+        best_scores, best_pair_index = score.max(dim=-1)
+        selected_scores, selected_cells = best_scores.topk(num_accepted, dim=1)
+        if not bool(torch.isfinite(selected_scores).all().item()):
+            raise RuntimeError("Invalid similarity merge selection produced non-finite scores")
+        selected_pair_index = best_pair_index.gather(1, selected_cells)
+        source_local = source_local_all.gather(1, selected_cells.unsqueeze(-1).expand(-1, -1, 6))
+        receiver_local = receiver_local_all.gather(1, selected_cells.unsqueeze(-1).expand(-1, -1, 6))
+        source_local = source_local.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
+        receiver_local = receiver_local.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
+        selected_positions = flat_cell_positions[selected_cells]
+        source_pos = selected_positions.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
+        receiver_pos = selected_positions.gather(2, receiver_local.unsqueeze(-1)).squeeze(-1)
+        return source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count
+
+    def _select_hybrid_pairs(
+        self,
+        similarities,
+        flat_cell_positions,
+        pair_left,
+        pair_right,
+        importance_cells,
+        protected_cells,
+        target_merges,
+    ):
+        src_local = torch.cat([pair_left, pair_right], dim=0)
+        dst_local = torch.cat([pair_right, pair_left], dim=0)
+        directed_cos = torch.cat([similarities, similarities], dim=-1)
+        src_importance = importance_cells[:, :, src_local]
+        dst_importance = importance_cells[:, :, dst_local]
+        score = (
+            float(self.config.score_alpha) * directed_cos
+            + float(self.config.score_beta) * dst_importance
+            - float(self.config.score_gamma) * src_importance
+        )
+        src_protected = protected_cells.gather(2, src_local.unsqueeze(0).unsqueeze(0).expand_as(src_importance))
+        valid = ~src_protected
+        if float(self.config.similarity_threshold) >= 0.0:
+            valid = valid & (directed_cos >= float(self.config.similarity_threshold))
+
+        num_accepted = self._candidate_target_merges(valid, target_merges)
+        candidate_count = int(valid.sum().item())
+        candidate_cell_count = self._candidate_cell_count(valid)
+        if num_accepted <= 0:
+            empty = torch.empty(similarities.shape[0], 0, device=similarities.device, dtype=torch.long)
+            return empty, empty, torch.empty_like(empty, dtype=similarities.dtype), 0, candidate_count, candidate_cell_count
+
+        score = score.masked_fill(~valid, -torch.inf)
+        best_score, best_dir_index = score.max(dim=-1)
+        selected_scores, selected_cells = best_score.topk(num_accepted, dim=1)
+        if not bool(torch.isfinite(selected_scores).all().item()):
+            raise RuntimeError("Invalid hybrid merge selection produced non-finite scores")
+        selected_dir_index = best_dir_index.gather(1, selected_cells)
+        source_local = src_local[selected_dir_index]
+        receiver_local = dst_local[selected_dir_index]
+        selected_positions = flat_cell_positions[selected_cells]
+        source_pos = selected_positions.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
+        receiver_pos = selected_positions.gather(2, receiver_local.unsqueeze(-1)).squeeze(-1)
+        selected_directed_cos = directed_cos.gather(
+            1, selected_cells.unsqueeze(-1).expand(-1, -1, directed_cos.shape[-1])
+        )
+        selected_cos = selected_directed_cos.gather(2, selected_dir_index.unsqueeze(-1)).squeeze(-1)
+        return source_pos, receiver_pos, selected_cos, num_accepted, candidate_count, candidate_cell_count
 
     def _reshape_2x2_cells(self, tensor, batch_size, t_grid, h_cells, w_cells, dim):
         return (
@@ -405,24 +742,81 @@ class LocalTokenMerger(nn.Module):
         selected_scores=None,
         implementation=None,
         fallback_reason=None,
+        importance=None,
+        protected_mask=None,
+        source_importance=None,
+        receiver_importance=None,
+        num_candidates=None,
+        num_candidate_cells=None,
+        num_accepted=None,
     ):
         before = int(x_before.shape[1])
         after = int(x_after.shape[1])
         ratio = float(after / max(1, before))
+        method = "A_similarity_only"
+        if self.config.strategy == "local_2x2_importance_protected_vec":
+            method = "B_importance_protected"
+        elif self.config.strategy == "local_2x2_hybrid_score_vec":
+            method = "C_hybrid_similarity_importance"
+        elif self.config.merge_ratio <= 0 and self.config.importance_source != "none":
+            method = "importance_diagnostic"
         info = {
+            "method": method,
             "strategy": self.config.strategy,
             "receiver": self.config.receiver,
+            "importance_source": self.config.importance_source,
+            "protect_mode": self.config.protect_mode,
+            "protect_ratio": float(self.config.protect_ratio),
+            "similarity_threshold": float(self.config.similarity_threshold),
+            "dynamic_ratio_mode": self.config.dynamic_ratio_mode,
+            "score_alpha": float(self.config.score_alpha),
+            "score_beta": float(self.config.score_beta),
+            "score_gamma": float(self.config.score_gamma),
+            "score_delta": float(self.config.score_delta),
+            "lambda_norm": float(self.config.lambda_norm),
+            "lambda_motion": float(self.config.lambda_motion),
             "num_tokens_before": before,
             "num_tokens_after": after,
             "num_merged_min_batch": int(min_merged),
             "num_merged_max_batch": int(max_merged),
+            "actual_merge_ratio": float(int(min_merged) / max(1, before)),
             "kept_ratio": ratio,
             "theoretical_attention_ratio": ratio * ratio,
+            "num_candidates": int(num_candidates) if num_candidates is not None else None,
+            "num_candidate_cells": (
+                int(num_candidate_cells) if num_candidate_cells is not None else None
+            ),
+            "num_accepted": int(num_accepted) if num_accepted is not None else int(min_merged),
+            "mean_source_importance": None,
+            "mean_receiver_importance": None,
+            "protected_token_fraction": None,
+            "importance_mean": None,
+            "importance_std": None,
+            "importance_min": None,
+            "importance_max": None,
+            "importance_entropy": None,
         }
         if implementation is not None:
             info["implementation"] = implementation
         if fallback_reason is not None:
             info["fallback_reason"] = fallback_reason
+
+        if importance is not None:
+            score = importance.detach().float()
+            score_sum = score.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            probs = score / score_sum
+            entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1)
+            info["importance_mean"] = float(score.mean().item())
+            info["importance_std"] = float(score.std(unbiased=False).item())
+            info["importance_min"] = float(score.min().item())
+            info["importance_max"] = float(score.max().item())
+            info["importance_entropy"] = float(entropy.mean().item())
+        if protected_mask is not None:
+            info["protected_token_fraction"] = float(protected_mask.float().mean().item())
+        if source_importance is not None and source_importance.numel() > 0:
+            info["mean_source_importance"] = float(source_importance.detach().float().mean().item())
+        if receiver_importance is not None and receiver_importance.numel() > 0:
+            info["mean_receiver_importance"] = float(receiver_importance.detach().float().mean().item())
 
         if selected_scores is None:
             info["mean_selected_similarity"] = None

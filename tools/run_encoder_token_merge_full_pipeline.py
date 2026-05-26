@@ -51,7 +51,22 @@ def parse_args():
     parser.add_argument("--merge_layers", type=str, default="8")
     parser.add_argument("--merge_ratios", type=str, default="0,0.05,0.10,0.125,0.25")
     parser.add_argument("--strategy", type=str, default="local_2x2_same_time")
+    parser.add_argument("--merge_strategy", dest="strategy", type=str)
     parser.add_argument("--receiver", type=str, default="max_norm")
+    parser.add_argument("--importance_source", type=str, default="none")
+    parser.add_argument("--protect_mode", type=str, default="none")
+    parser.add_argument("--protect_ratio", type=float, default=0.0)
+    parser.add_argument("--similarity_threshold", type=float, default=-1.0)
+    parser.add_argument("--dynamic_ratio_mode", type=str, default="none")
+    parser.add_argument("--score_alpha", type=float, default=1.0)
+    parser.add_argument("--score_beta", type=float, default=0.3)
+    parser.add_argument("--score_gamma", type=float, default=0.5)
+    parser.add_argument("--score_delta", type=float, default=0.0)
+    parser.add_argument("--lambda_norm", type=float, default=0.3)
+    parser.add_argument("--lambda_motion", type=float, default=0.7)
+    parser.add_argument("--debug_dump_scores", action="store_true")
+    parser.add_argument("--run_no_merge_baseline", action="store_true")
+    parser.add_argument("--run_r0_sanity", action="store_true")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--amp", action="store_true")
@@ -181,6 +196,18 @@ def load_model(args, checkpoint_path, num_frames, merge_layers):
         "receiver": args.receiver,
         "restore_dense": True,
         "profile": bool(args.profile_segments),
+        "importance_source": args.importance_source,
+        "protect_mode": args.protect_mode,
+        "protect_ratio": float(args.protect_ratio),
+        "similarity_threshold": float(args.similarity_threshold),
+        "dynamic_ratio_mode": args.dynamic_ratio_mode,
+        "score_alpha": float(args.score_alpha),
+        "score_beta": float(args.score_beta),
+        "score_gamma": float(args.score_gamma),
+        "score_delta": float(args.score_delta),
+        "lambda_norm": float(args.lambda_norm),
+        "lambda_motion": float(args.lambda_motion),
+        "debug_dump_scores": bool(args.debug_dump_scores),
     }
     model = getattr(vision_transformer, args.model_arch)(
         img_size=(args.img_size, args.img_size),
@@ -222,9 +249,14 @@ def synchronize(device):
 
 
 def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, receiver, profile):
-    if str(strategy) == "local_2x2_same_time_vec" and len(tuple(merge_layers)) > 1:
+    vectorized_strategies = {
+        "local_2x2_same_time_vec",
+        "local_2x2_importance_protected_vec",
+        "local_2x2_hybrid_score_vec",
+    }
+    if str(strategy) in vectorized_strategies and len(tuple(merge_layers)) > 1:
         raise ValueError(
-            "local_2x2_same_time_vec currently supports exactly one merge layer. "
+            f"{strategy} currently supports exactly one merge layer. "
             "Use a single layer for vectorized benchmarking."
         )
     model.merge_config.enabled = bool(enabled)
@@ -234,6 +266,23 @@ def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, rec
     model.merge_config.receiver = str(receiver)
     model.merge_config.restore_dense = True
     model.merge_config.profile = bool(profile)
+    if getattr(model, "token_merger", None) is not None:
+        model.token_merger.config = model.merge_config
+
+
+def set_merge_experiment_fields(model, args):
+    model.merge_config.importance_source = str(args.importance_source)
+    model.merge_config.protect_mode = str(args.protect_mode)
+    model.merge_config.protect_ratio = float(args.protect_ratio)
+    model.merge_config.similarity_threshold = float(args.similarity_threshold)
+    model.merge_config.dynamic_ratio_mode = str(args.dynamic_ratio_mode)
+    model.merge_config.score_alpha = float(args.score_alpha)
+    model.merge_config.score_beta = float(args.score_beta)
+    model.merge_config.score_gamma = float(args.score_gamma)
+    model.merge_config.score_delta = float(args.score_delta)
+    model.merge_config.lambda_norm = float(args.lambda_norm)
+    model.merge_config.lambda_motion = float(args.lambda_motion)
+    model.merge_config.debug_dump_scores = bool(args.debug_dump_scores)
     if getattr(model, "token_merger", None) is not None:
         model.token_merger.config = model.merge_config
 
@@ -249,6 +298,7 @@ def run_timed_forward(model, video, args, *, enabled, merge_layers, merge_ratio)
         receiver=args.receiver,
         profile=bool(args.profile_segments),
     )
+    set_merge_experiment_fields(model, args)
     if str(args.device).startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     synchronize(args.device)
@@ -305,8 +355,22 @@ def write_csv(rows, out_dir):
     fields = [
         "config",
         "sample",
+        "method",
+        "strategy",
+        "importance_source",
+        "protect_mode",
+        "protect_ratio",
+        "similarity_threshold",
+        "dynamic_ratio_mode",
+        "score_alpha",
+        "score_beta",
+        "score_gamma",
+        "score_delta",
+        "lambda_norm",
+        "lambda_motion",
         "merge_ratio",
         "merge_layers",
+        "actual_merge_ratio",
         "tokens_before",
         "tokens_after",
         "tokens_removed",
@@ -321,7 +385,29 @@ def write_csv(rows, out_dir):
         "total_profiled_ms_mean",
         "peak_memory_mb_mean",
         "mean_cosine",
+        "median_cosine",
+        "p10_cosine",
+        "p1_cosine",
+        "min_cosine",
         "relative_l2",
+        "mse",
+        "max_token_error",
+        "p95_token_error",
+        "p99_token_error",
+        "mean_selected_similarity",
+        "min_selected_similarity",
+        "max_selected_similarity",
+        "mean_source_importance",
+        "mean_receiver_importance",
+        "protected_token_fraction",
+        "num_candidates",
+        "num_candidate_cells",
+        "num_accepted",
+        "importance_mean",
+        "importance_std",
+        "importance_min",
+        "importance_max",
+        "importance_entropy",
         "sequence_reduced",
         "final_implementation",
         "any_fallback",
@@ -332,6 +418,71 @@ def write_csv(rows, out_dir):
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fields})
+
+
+def write_jsonl(rows, path):
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def method_name_for_strategy(strategy):
+    if strategy == "local_2x2_importance_protected_vec":
+        return "B_importance_protected"
+    if strategy == "local_2x2_hybrid_score_vec":
+        return "C_hybrid_similarity_importance"
+    return "A_similarity_only"
+
+
+def strategy_label(strategy):
+    mapping = {
+        "local_2x2_same_time": "same_time_python",
+        "local_2x2_same_time_python": "same_time_python",
+        "local_2x2_same_time_vec": "same_time_vec",
+        "local_2x2_importance_protected_vec": "protect_vec",
+        "local_2x2_hybrid_score_vec": "hybrid_vec",
+    }
+    return mapping.get(str(strategy), str(strategy).replace("/", "_"))
+
+
+def make_config_name(args, merge_layers, ratio):
+    layers = "-".join(str(v) for v in merge_layers)
+    method = method_name_for_strategy(str(args.strategy))
+    strategy = strategy_label(args.strategy)
+    if float(ratio) == 0.0 and bool(args.run_r0_sanity):
+        return f"B0_r0_sanity_{strategy}_l{layers}_{args.img_size}"
+    if method.startswith("A_"):
+        return f"A_sim_{strategy}_l{layers}_r{float(ratio):g}_{args.img_size}"
+    if method.startswith("B_"):
+        return (
+            f"B_protect_{args.importance_source}_{args.protect_mode}_"
+            f"l{layers}_r{float(ratio):g}_{args.img_size}"
+        )
+    return (
+        f"C_hybrid_{args.importance_source}_{args.protect_mode}_"
+        f"l{layers}_r{float(ratio):g}_{args.img_size}"
+    )
+
+
+def experiment_fields(args, info=None):
+    method = method_name_for_strategy(str(args.strategy))
+    if info:
+        method = str(info.get("method", method))
+    return {
+        "method": method,
+        "strategy": str(args.strategy),
+        "importance_source": str(args.importance_source),
+        "protect_mode": str(args.protect_mode),
+        "protect_ratio": float(args.protect_ratio),
+        "similarity_threshold": float(args.similarity_threshold),
+        "dynamic_ratio_mode": str(args.dynamic_ratio_mode),
+        "score_alpha": float(args.score_alpha),
+        "score_beta": float(args.score_beta),
+        "score_gamma": float(args.score_gamma),
+        "score_delta": float(args.score_delta),
+        "lambda_norm": float(args.lambda_norm),
+        "lambda_motion": float(args.lambda_motion),
+    }
 
 
 def write_plots(summary, out_dir):
@@ -386,6 +537,8 @@ def main():
         raise ValueError("--merge_layers must contain at least one layer index")
     if not merge_ratios:
         raise ValueError("--merge_ratios must contain at least one ratio")
+    if bool(args.run_r0_sanity) and all(abs(float(r)) > 1e-12 for r in merge_ratios):
+        merge_ratios = [0.0] + merge_ratios
 
     videos = []
     samples = []
@@ -415,6 +568,7 @@ def main():
     baseline_rows = []
     baseline_latencies = []
     baseline_memories = []
+    per_run_rows = []
     print("[RUN] baseline full encoder pipeline", flush=True)
     for sample_idx, video in enumerate(videos):
         for _ in range(max(0, int(args.warmup))):
@@ -431,6 +585,7 @@ def main():
         memories = []
         profiles = []
         for _ in range(max(1, int(args.repeats))):
+            repeat_idx = len(latencies)
             out, infos, elapsed_ms, peak_mb, profile = run_timed_forward(
                 model,
                 video,
@@ -444,11 +599,40 @@ def main():
             profiles.append(profile)
             if peak_mb is not None:
                 memories.append(peak_mb)
+            per_run_rows.append(
+                {
+                    "config": "baseline",
+                    "sample": sample_idx,
+                    "repeat": repeat_idx,
+                    "enabled": False,
+                    "merge_ratio": 0.0,
+                    "latency_ms": float(elapsed_ms),
+                    "peak_memory_mb": float(peak_mb) if peak_mb is not None else None,
+                    "profile": profile,
+                    "merge_info": infos,
+                }
+            )
         profile_summary = summarize_profile(profiles)
         baseline_outputs.append(outputs[-1])
         row = {
             "config": "baseline",
             "sample": sample_idx,
+            **{
+                "method": "B0_no_merge",
+                "strategy": "none",
+                "importance_source": "none",
+                "protect_mode": "none",
+                "protect_ratio": 0.0,
+                "similarity_threshold": -1.0,
+                "dynamic_ratio_mode": "none",
+                "score_alpha": "",
+                "score_beta": "",
+                "score_gamma": "",
+                "score_delta": "",
+                "lambda_norm": "",
+                "lambda_motion": "",
+                "actual_merge_ratio": 0.0,
+            },
             "merge_ratio": 0.0,
             "merge_layers": "",
             "tokens_before": int(outputs[-1].shape[1]),
@@ -459,7 +643,29 @@ def main():
             **profile_summary,
             "peak_memory_mb_mean": float(np.mean(memories)) if memories else None,
             "mean_cosine": 1.0,
+            "median_cosine": 1.0,
+            "p10_cosine": 1.0,
+            "p1_cosine": 1.0,
+            "min_cosine": 1.0,
             "relative_l2": 0.0,
+            "mse": 0.0,
+            "max_token_error": 0.0,
+            "p95_token_error": 0.0,
+            "p99_token_error": 0.0,
+            "mean_selected_similarity": "",
+            "min_selected_similarity": "",
+            "max_selected_similarity": "",
+            "mean_source_importance": "",
+            "mean_receiver_importance": "",
+            "protected_token_fraction": "",
+                "num_candidates": "",
+                "num_candidate_cells": "",
+                "num_accepted": "",
+            "importance_mean": "",
+            "importance_std": "",
+            "importance_min": "",
+            "importance_max": "",
+            "importance_entropy": "",
             "sequence_reduced": False,
             "latency": summarize_times(latencies),
             "profile": profile_summary,
@@ -471,7 +677,7 @@ def main():
     config_summaries = []
     all_rows = list(baseline_rows)
     for ratio in merge_ratios:
-        config_name = f"l{'-'.join(str(v) for v in merge_layers)}_r{ratio:g}"
+        config_name = make_config_name(args, merge_layers, ratio)
         print(f"[RUN] merge config {config_name}", flush=True)
         config_rows = []
         for sample_idx, video in enumerate(videos):
@@ -490,6 +696,7 @@ def main():
             memories = []
             profiles = []
             for _ in range(max(1, int(args.repeats))):
+                repeat_idx = len(latencies)
                 out, infos, elapsed_ms, peak_mb, profile = run_timed_forward(
                     model,
                     video,
@@ -504,11 +711,25 @@ def main():
                 profiles.append(profile)
                 if peak_mb is not None:
                     memories.append(peak_mb)
+                per_run_rows.append(
+                    {
+                        "config": config_name,
+                        "sample": sample_idx,
+                        "repeat": repeat_idx,
+                        "enabled": True,
+                        "merge_ratio": float(ratio),
+                        "latency_ms": float(elapsed_ms),
+                        "peak_memory_mb": float(peak_mb) if peak_mb is not None else None,
+                        "profile": profile,
+                        "merge_info": infos,
+                    }
+                )
             profile_summary = summarize_profile(profiles)
             y = baseline_outputs[sample_idx]
             y_merge = outputs[-1]
             cos = F.cosine_similarity(y, y_merge, dim=-1).reshape(-1)
             diff = y - y_merge
+            token_error = diff.norm(dim=-1).reshape(-1)
             rel_l2 = float(diff.norm().item() / y.norm().clamp_min(1e-12).item())
             info = infos_last[-1] if infos_last else {}
             fallback_reasons = [
@@ -521,8 +742,10 @@ def main():
             row = {
                 "config": config_name,
                 "sample": sample_idx,
+                **experiment_fields(args, info),
                 "merge_ratio": float(ratio),
                 "merge_layers": ",".join(str(v) for v in merge_layers),
+                "actual_merge_ratio": float(info.get("actual_merge_ratio", 0.0)),
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
                 "tokens_removed": int(tokens_before - tokens_after),
@@ -532,9 +755,28 @@ def main():
                 "peak_memory_mb_mean": float(np.mean(memories)) if memories else None,
                 "mean_cosine": float(cos.mean().item()),
                 "median_cosine": float(cos.median().item()),
+                "p10_cosine": float(torch.quantile(cos, 0.10).item()),
+                "p1_cosine": float(torch.quantile(cos, 0.01).item()),
                 "min_cosine": float(cos.min().item()),
                 "relative_l2": rel_l2,
                 "mse": float(diff.square().mean().item()),
+                "max_token_error": float(token_error.max().item()),
+                "p95_token_error": float(torch.quantile(token_error, 0.95).item()),
+                "p99_token_error": float(torch.quantile(token_error, 0.99).item()),
+                "mean_selected_similarity": info.get("mean_selected_similarity"),
+                "min_selected_similarity": info.get("min_selected_similarity"),
+                "max_selected_similarity": info.get("max_selected_similarity"),
+                "mean_source_importance": info.get("mean_source_importance"),
+                "mean_receiver_importance": info.get("mean_receiver_importance"),
+                "protected_token_fraction": info.get("protected_token_fraction"),
+                "num_candidates": info.get("num_candidates"),
+                "num_candidate_cells": info.get("num_candidate_cells"),
+                "num_accepted": info.get("num_accepted"),
+                "importance_mean": info.get("importance_mean"),
+                "importance_std": info.get("importance_std"),
+                "importance_min": info.get("importance_min"),
+                "importance_max": info.get("importance_max"),
+                "importance_entropy": info.get("importance_entropy"),
                 "sequence_reduced": bool(info.get("sequence_reduced", False)),
                 "final_implementation": str(info.get("implementation", "")),
                 "any_fallback": bool(fallback_reasons),
@@ -571,7 +813,11 @@ def main():
                     "tokens_after": int(np.mean([r["tokens_after"] for r in config_rows])),
                     "tokens_removed": int(np.mean([r["tokens_removed"] for r in config_rows])),
                     "mean_cosine": float(np.mean([r["mean_cosine"] for r in config_rows])),
+                    "median_cosine": float(np.mean([r["median_cosine"] for r in config_rows])),
+                    "p10_cosine": float(np.mean([r["p10_cosine"] for r in config_rows])),
+                    "p1_cosine": float(np.mean([r["p1_cosine"] for r in config_rows])),
                     "relative_l2": float(np.mean([r["relative_l2"] for r in config_rows])),
+                    "mse": float(np.mean([r["mse"] for r in config_rows])),
                     "sequence_reduced_all": bool(
                         all(r["sequence_reduced"] for r in config_rows)
                     ),
@@ -605,6 +851,8 @@ def main():
             "Reads npz['imgs'] and reruns the dense V-JEPA encoder online.",
             "Does not use cached npz['vjepa_feats'] as encoder output.",
             "Compares no-merge baseline with encoder-side local token merge.",
+            "dynamic_ratio_mode, score_delta, and debug_dump_scores are metadata-only in this implementation.",
+            "Use final_implementation and any_fallback fields to distinguish vectorized runs from Python fallback.",
         ],
         "input": {
             "num_samples": len(samples),
@@ -618,10 +866,25 @@ def main():
             "checkpoint": str(checkpoint_path),
             "amp": bool(args.amp),
         },
+        "merge_experiment": {
+            "strategy": str(args.strategy),
+            "importance_source": str(args.importance_source),
+            "protect_mode": str(args.protect_mode),
+            "protect_ratio": float(args.protect_ratio),
+            "similarity_threshold": float(args.similarity_threshold),
+            "dynamic_ratio_mode": str(args.dynamic_ratio_mode),
+            "score_alpha": float(args.score_alpha),
+            "score_beta": float(args.score_beta),
+            "score_gamma": float(args.score_gamma),
+            "score_delta": float(args.score_delta),
+            "lambda_norm": float(args.lambda_norm),
+            "lambda_motion": float(args.lambda_motion),
+        },
         "baseline": baseline_summary,
         "configs": [{"config": "baseline", **baseline_summary}] + config_summaries,
     }
     write_csv(all_rows, out_dir)
+    write_jsonl(per_run_rows, out_dir / "per_run_profile.jsonl")
     write_plots(summary, out_dir)
     with (out_dir / "full_pipeline_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)

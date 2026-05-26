@@ -578,6 +578,23 @@ def build_dense_jepa_merge_config(args):
         ),
         "receiver": str(getattr(args, "dense_jepa_merge_receiver", "max_norm")),
         "restore_dense": bool(getattr(args, "dense_jepa_restore_dense", True)),
+        "importance_source": str(
+            getattr(args, "dense_jepa_importance_source", "none")
+        ),
+        "protect_mode": str(getattr(args, "dense_jepa_protect_mode", "none")),
+        "protect_ratio": float(getattr(args, "dense_jepa_protect_ratio", 0.0)),
+        "similarity_threshold": float(
+            getattr(args, "dense_jepa_similarity_threshold", -1.0)
+        ),
+        "dynamic_ratio_mode": str(
+            getattr(args, "dense_jepa_dynamic_ratio_mode", "none")
+        ),
+        "score_alpha": float(getattr(args, "dense_jepa_score_alpha", 1.0)),
+        "score_beta": float(getattr(args, "dense_jepa_score_beta", 0.3)),
+        "score_gamma": float(getattr(args, "dense_jepa_score_gamma", 0.5)),
+        "score_delta": float(getattr(args, "dense_jepa_score_delta", 0.0)),
+        "lambda_norm": float(getattr(args, "dense_jepa_lambda_norm", 0.3)),
+        "lambda_motion": float(getattr(args, "dense_jepa_lambda_motion", 0.7)),
     }
 
 
@@ -3679,6 +3696,42 @@ if __name__ == "__main__":
         default="max_norm",
         help="receiver selection rule for encoder-side token merge",
     )
+    parser.add_argument(
+        "--dense_jepa_importance_source",
+        type=str,
+        default="none",
+        help="importance score source: none, norm, motion, norm_motion, or qk_global_hidden",
+    )
+    parser.add_argument(
+        "--dense_jepa_protect_mode",
+        type=str,
+        default="none",
+        help="token protection mode: none, local_top1, global_topk, or local_top1_global_topk",
+    )
+    parser.add_argument(
+        "--dense_jepa_protect_ratio",
+        type=float,
+        default=0.0,
+        help="global top-k protection ratio when using a global protection mode",
+    )
+    parser.add_argument(
+        "--dense_jepa_similarity_threshold",
+        type=float,
+        default=-1.0,
+        help="minimum local cosine similarity accepted for token merge; negative disables it",
+    )
+    parser.add_argument(
+        "--dense_jepa_dynamic_ratio_mode",
+        type=str,
+        default="none",
+        help="dynamic ratio mode metadata for token merge experiments",
+    )
+    parser.add_argument("--dense_jepa_score_alpha", type=float, default=1.0)
+    parser.add_argument("--dense_jepa_score_beta", type=float, default=0.3)
+    parser.add_argument("--dense_jepa_score_gamma", type=float, default=0.5)
+    parser.add_argument("--dense_jepa_score_delta", type=float, default=0.0)
+    parser.add_argument("--dense_jepa_lambda_norm", type=float, default=0.3)
+    parser.add_argument("--dense_jepa_lambda_motion", type=float, default=0.7)
     parser.add_argument(
         "--no_dense_jepa_restore_dense",
         dest="dense_jepa_restore_dense",
