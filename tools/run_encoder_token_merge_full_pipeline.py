@@ -262,12 +262,36 @@ def load_model(args, checkpoint_path, num_frames, merge_layers):
     print(f"[INFO] load_state_dict={msg}", flush=True)
     model.to(args.device)
     model.eval()
+    _ensure_token_merger(model)
     return model
 
 
 def synchronize(device):
     if str(device).startswith("cuda"):
         torch.cuda.synchronize()
+
+
+def _ensure_token_merger(model):
+    """Ensure ``model.token_merger`` matches the configured strategy.
+
+    Diagnostic-only strategies (B2/C2) require ``DiagnosticTokenMerger``; all
+    main-path strategies (A/B/C) use ``LocalTokenMerger``. This is the single
+    opt-in point that lets this research pipeline reproduce the No-Go B2/C2
+    variants without ever exposing them to the encoder or the training script.
+    """
+    from src.models.utils.token_merge import LocalTokenMerger
+    from src.models.utils.token_merge_diagnostics import DiagnosticTokenMerger
+
+    diagnostic_only = set(DiagnosticTokenMerger.VECTORIZED_STRATEGIES) - set(
+        LocalTokenMerger.VECTORIZED_STRATEGIES
+    )
+    strategy = str(model.merge_config.strategy)
+    want_cls = DiagnosticTokenMerger if strategy in diagnostic_only else LocalTokenMerger
+    current = getattr(model, "token_merger", None)
+    if current is None or type(current) is not want_cls:
+        model.token_merger = want_cls(model.merge_config)
+    else:
+        current.config = model.merge_config
 
 
 def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, receiver, profile):
@@ -290,8 +314,7 @@ def set_merge_config(model, *, enabled, merge_layers, merge_ratio, strategy, rec
     model.merge_config.receiver = str(receiver)
     model.merge_config.restore_dense = True
     model.merge_config.profile = bool(profile)
-    if getattr(model, "token_merger", None) is not None:
-        model.token_merger.config = model.merge_config
+    _ensure_token_merger(model)
 
 
 def set_merge_experiment_fields(model, args):
@@ -315,8 +338,7 @@ def set_merge_experiment_fields(model, args):
     model.merge_config.keep_score_beta = float(args.keep_score_beta)
     model.merge_config.similarity_gate_epsilon = float(args.similarity_gate_epsilon)
     model.merge_config.direction_by_importance = bool(args.direction_by_importance)
-    if getattr(model, "token_merger", None) is not None:
-        model.token_merger.config = model.merge_config
+    _ensure_token_merger(model)
 
 
 @torch.no_grad()
