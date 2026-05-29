@@ -15,6 +15,26 @@ from src.models.utils.modules import Block
 from src.models.utils.patch_embed import PatchEmbed, PatchEmbed3D
 from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.models.utils.token_merge import LocalTokenMerger, init_token_merge_state, normalize_merge_config, restore_dense_tokens
+
+
+def _build_token_merger(merge_config):
+    """Pick the merger class for the configured strategy.
+
+    Grid-agnostic diagnostic strategies (currently ``bsm_ksim_gradual_vec``) live
+    only in ``DiagnosticTokenMerger`` and need its ``_forward_bsm``. Every other
+    strategy (A/B/C, the main path) uses the base ``LocalTokenMerger`` so the
+    main training/inference path is byte-identical and never imports diagnostics.
+    """
+    strategy = str(getattr(merge_config, "strategy", ""))
+    if strategy in LocalTokenMerger.VECTORIZED_STRATEGIES:
+        return LocalTokenMerger(merge_config)
+    try:
+        from src.models.utils.token_merge_diagnostics import DiagnosticTokenMerger
+    except Exception:
+        return LocalTokenMerger(merge_config)
+    if strategy in DiagnosticTokenMerger.VECTORIZED_STRATEGIES:
+        return DiagnosticTokenMerger(merge_config)
+    return LocalTokenMerger(merge_config)
 from src.utils.tensors import trunc_normal_
 
 
@@ -70,7 +90,7 @@ class VisionTransformer(nn.Module):
         self.tubelet_size = tubelet_size
         self.is_video = num_frames > 1
         self.merge_config = normalize_merge_config(merge_config)
-        self.token_merger = LocalTokenMerger(self.merge_config) if self.merge_config.enabled else None
+        self.token_merger = _build_token_merger(self.merge_config) if self.merge_config.enabled else None
 
         self.use_activation_checkpointing = use_activation_checkpointing
 
@@ -196,7 +216,7 @@ class VisionTransformer(nn.Module):
         if merge_enabled and not self.use_rope:
             raise NotImplementedError("encoder-side token merge currently requires RoPE token ids")
         if merge_enabled and self.token_merger is None:
-            self.token_merger = LocalTokenMerger(self.merge_config)
+            self.token_merger = _build_token_merger(self.merge_config)
 
         if masks is not None and not isinstance(masks, list):
             masks = [masks]
@@ -242,6 +262,23 @@ class VisionTransformer(nn.Module):
             x = apply_masks(x, masks)
             masks = torch.cat(masks, dim=0)
 
+        # Arm the post-RoPE key stash on the attention modules of the merge
+        # layers ONLY for the grid-agnostic K-BSM strategy with the key metric.
+        # Every other strategy leaves the flag unset so attention is byte-for-byte
+        # unchanged. (RoPEAttention.forward reads getattr(self, "_stash_attn_key",
+        # False) and pays nothing when it is False.)
+        bsm_key_metric = (
+            merge_enabled
+            and getattr(self.merge_config, "strategy", "") == "bsm_ksim_gradual_vec"
+            and getattr(self.merge_config, "bsm_match_metric", "key") == "key"
+        )
+        if merge_enabled:
+            merge_layer_set = set(int(j) for j in self.merge_config.merge_layers)
+            for j, blk_j in enumerate(self.blocks):
+                attn_j = getattr(blk_j, "attn", None)
+                if attn_j is not None:
+                    attn_j._stash_attn_key = bool(bsm_key_metric and j in merge_layer_set)
+
         # Fwd prop
         outs = []
         block_segment_start = _profile_now(profile_device, profile_enabled)
@@ -275,6 +312,14 @@ class VisionTransformer(nn.Module):
                 else:
                     profile["pre_merge_blocks_ms"] += block_segment_ms
                 before = x.shape[1]
+                # Read the post-RoPE key stashed by THIS block's attention (set
+                # only for bsm_ksim_gradual_vec with the key metric). None for
+                # every other strategy -> merger uses hidden-feature cosine.
+                attn_key = None
+                attn_mod = getattr(blk, "attn", None)
+                if attn_mod is not None:
+                    attn_key = getattr(attn_mod, "_stashed_key", None)
+                    attn_mod._stashed_key = None  # release reference promptly
                 merge_start = _profile_now(profile_device, profile_enabled)
                 x, token_ids, token_size, rep_for_orig, info = self.token_merger(
                     x=x,
@@ -284,6 +329,7 @@ class VisionTransformer(nn.Module):
                     t_grid=T,
                     h_grid=H_patches,
                     w_grid=W_patches,
+                    attn_key=attn_key,
                 )
                 measured_merge_ms = (
                     _profile_now(profile_device, profile_enabled) - merge_start

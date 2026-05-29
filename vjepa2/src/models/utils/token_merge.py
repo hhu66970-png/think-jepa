@@ -35,6 +35,10 @@ class MergeConfig:
     keep_score_beta: float = 0.0
     similarity_gate_epsilon: float = 0.01
     direction_by_importance: bool = True
+    # Matching metric for bsm_ksim_gradual_vec: "key" => post-RoPE attention Key
+    # cosine (SDPA-safe stash), "feature" => block-output hidden-feature cosine.
+    # Ignored by every other strategy. Defaulted so A/B/C/B2/C2 are unaffected.
+    bsm_match_metric: str = "key"
 
 
 def normalize_merge_config(config):
@@ -57,7 +61,19 @@ def normalize_merge_config(config):
         "local_keep_then_merge_vec",
         "local_2x2_similarity_gated_importance_vec",
     )
-    if strategy in vectorized_strategies and len(layers) > 1:
+    # Grid-agnostic strategies operate on arbitrary (already-compressed) token
+    # sets and are explicitly ALLOWED to merge across MULTIPLE layers. The 2x2
+    # cell strategies above still require a single dense merge layer. bsm is not
+    # in vectorized_strategies, so the guard already skips it; this allow-set
+    # documents intent and stays robust if it is ever added to the tuple above.
+    grid_agnostic_multilayer_strategies = (
+        "bsm_ksim_gradual_vec",
+    )
+    if (
+        strategy in vectorized_strategies
+        and strategy not in grid_agnostic_multilayer_strategies
+        and len(layers) > 1
+    ):
         raise ValueError(
             f"{strategy} currently supports exactly one merge layer. "
             "Use a single layer or implement sparse-state vectorized merging before "
@@ -107,6 +123,7 @@ def normalize_merge_config(config):
         keep_score_beta=float(config.get("keep_score_beta", 0.0)),
         similarity_gate_epsilon=float(config.get("similarity_gate_epsilon", 0.01)),
         direction_by_importance=bool(config.get("direction_by_importance", True)),
+        bsm_match_metric=str(config.get("bsm_match_metric", "key")),
     )
     _validate_merge_config(normalized)
     return normalized
@@ -258,7 +275,7 @@ class LocalTokenMerger(nn.Module):
         self.config = normalize_merge_config(config)
 
     @torch.no_grad()
-    def forward(self, x, token_ids, token_size, rep_for_orig, t_grid, h_grid, w_grid):
+    def forward(self, x, token_ids, token_size, rep_for_orig, t_grid, h_grid, w_grid, attn_key=None):
         if self.config.strategy in ("local_2x2_same_time", "local_2x2_same_time_python"):
             return self._forward_python(
                 x,
@@ -272,6 +289,18 @@ class LocalTokenMerger(nn.Module):
             )
         if self.config.strategy not in self.VECTORIZED_STRATEGIES:
             raise ValueError(f"Unsupported merge strategy: {self.config.strategy}")
+
+        # Grid-agnostic global bipartite soft matching (BSM). Handled entirely
+        # separately from the dense 2x2 path; works on compressed token sets and
+        # across multiple merge layers. _forward_bsm is defined ONLY on
+        # DiagnosticTokenMerger and the strategy name is registered ONLY in that
+        # subclass's VECTORIZED_STRATEGIES, so the base LocalTokenMerger raises
+        # "Unsupported merge strategy" above and never reaches this branch.
+        if self.config.strategy == "bsm_ksim_gradual_vec":
+            return self._forward_bsm(
+                x, token_ids, token_size, rep_for_orig,
+                int(t_grid), int(h_grid), int(w_grid), attn_key,
+            )
 
         if self.config.merge_ratio <= 0.0:
             importance = None
@@ -417,6 +446,12 @@ class LocalTokenMerger(nn.Module):
         return x_new, ids_new, size_new, rep_new, info
 
     def _can_vectorize_dense_grid(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
+        # Grid-agnostic global BSM does not require a dense contiguous 2x2 grid;
+        # it can run on already-compressed token sets at every merge layer. (The
+        # forward() dispatch routes bsm before this is reached; this guard is a
+        # defensive no-op for that strategy.)
+        if self.config.strategy == "bsm_ksim_gradual_vec":
+            return True, None
         expected_tokens = int(t_grid * h_grid * w_grid)
         if h_grid % 2 != 0 or w_grid % 2 != 0:
             return False, "odd_spatial_grid"
@@ -512,33 +547,20 @@ class LocalTokenMerger(nn.Module):
                 num_accepted=0,
             )
 
-        source_ids = token_ids.gather(1, source_pos)
-        receiver_ids = token_ids.gather(1, receiver_pos)
-        source_weight = token_size.gather(1, source_pos)
-        receiver_weight = token_size.gather(1, receiver_pos)
-        total_weight = source_weight + receiver_weight
-
-        source_x = x.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))
-        receiver_x = x.gather(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim))
-        merged_x = (
-            receiver_x * receiver_weight.unsqueeze(-1)
-            + source_x * source_weight.unsqueeze(-1)
-        ) / total_weight.unsqueeze(-1)
-
-        x_updated = x.clone()
-        token_size_updated = token_size.clone()
-        x_updated.scatter_(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim), merged_x)
-        token_size_updated.scatter_(1, receiver_pos, total_weight)
-
-        keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
-        keep.scatter_(1, source_pos, False)
-        num_after = num_tokens - num_accepted
-        x_new = x_updated[keep].reshape(batch_size, num_after, dim)
-        ids_new = token_ids[keep].reshape(batch_size, num_after)
-        size_new = token_size_updated[keep].reshape(batch_size, num_after)
-
-        rep_new = rep_for_orig.clone()
-        rep_new.scatter_(1, source_ids, receiver_ids)
+        # Shared, grid-agnostic merge/compaction (gather/scatter by token
+        # position, size-weighted average, build compressed tensors, update
+        # rep_for_orig). Reused verbatim by the global BSM path. multi_layer_rep
+        # is False here so the A/B/C/B2/C2 tensors are byte-identical.
+        x_new, ids_new, size_new, rep_new = self._apply_merge_from_positions(
+            x,
+            token_ids,
+            token_size,
+            rep_for_orig,
+            source_pos,
+            receiver_pos,
+            num_accepted,
+            multi_layer_rep=False,
+        )
 
         info = self._info(
             x,
@@ -572,6 +594,81 @@ class LocalTokenMerger(nn.Module):
             ),
         )
         return x_new, ids_new, size_new, rep_new, info
+
+    def _apply_merge_from_positions(
+        self,
+        x,
+        token_ids,
+        token_size,
+        rep_for_orig,
+        source_pos,
+        receiver_pos,
+        num_accepted,
+        multi_layer_rep=False,
+    ):
+        """Shared post-pair-selection merge/compaction (grid-agnostic).
+
+        Gather source/receiver by token POSITION, size-weighted average into the
+        receiver, drop the source positions, and compact to a dense
+        ``[B, N-num_accepted, D]``. This assumes source positions are disjoint
+        from each other AND from receiver positions, and that each receiver is
+        targeted at most once (true for the 2x2 cell strategies). Extracted from
+        ``_forward_vectorized`` so the 2x2 path and global BSM share ONE
+        implementation; with ``multi_layer_rep=False`` the produced tensors are
+        byte-identical to the original A/B/C/B2/C2 behaviour.
+        """
+        batch_size, num_tokens, dim = x.shape
+
+        source_ids = token_ids.gather(1, source_pos)
+        receiver_ids = token_ids.gather(1, receiver_pos)
+        source_weight = token_size.gather(1, source_pos)
+        receiver_weight = token_size.gather(1, receiver_pos)
+        total_weight = source_weight + receiver_weight
+
+        source_x = x.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))
+        receiver_x = x.gather(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim))
+        merged_x = (
+            receiver_x * receiver_weight.unsqueeze(-1)
+            + source_x * source_weight.unsqueeze(-1)
+        ) / total_weight.unsqueeze(-1)
+
+        x_updated = x.clone()
+        token_size_updated = token_size.clone()
+        x_updated.scatter_(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim), merged_x)
+        token_size_updated.scatter_(1, receiver_pos, total_weight)
+
+        keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
+        keep.scatter_(1, source_pos, False)
+        num_after = num_tokens - num_accepted
+        x_new = x_updated[keep].reshape(batch_size, num_after, dim)
+        ids_new = token_ids[keep].reshape(batch_size, num_after)
+        size_new = token_size_updated[keep].reshape(batch_size, num_after)
+
+        if multi_layer_rep:
+            # Remap EVERY original whose CURRENT rep is one of this layer's
+            # sources (not just originals whose id == source_id, which is all the
+            # base scatter did). Within one layer source positions are disjoint
+            # and never coincide with receivers, so a single identity-LUT scatter
+            # + gather is exact; across layers it composes because each layer
+            # applies its own remap to the running rep_for_orig. This is the
+            # vectorized equivalent of the Python path's
+            # ``rep[rep == source_id] = receiver_id`` and is required for correct
+            # restore_dense under gradual multi-layer merging.
+            num_original_tokens = rep_for_orig.shape[1]
+            remap = (
+                torch.arange(num_original_tokens, device=x.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+                .clone()
+            )
+            remap.scatter_(1, source_ids, receiver_ids)
+            rep_new = remap.gather(1, rep_for_orig)
+        else:
+            # BYTE-IDENTICAL to the original A/B/C/B2/C2 behaviour.
+            rep_new = rep_for_orig.clone()
+            rep_new.scatter_(1, source_ids, receiver_ids)
+
+        return x_new, ids_new, size_new, rep_new
 
     def _compute_protected_cells(self, importance, importance_cells, flat_cell_positions):
         protected = torch.zeros_like(importance_cells, dtype=torch.bool)
