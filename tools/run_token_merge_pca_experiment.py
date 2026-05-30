@@ -87,7 +87,8 @@ def ensure_token_merger(model):
 
 
 def apply_merge_config(model, *, enabled, strategy, merge_layers, merge_ratio,
-                       restore_dense, receiver="max_norm", bsm_match_metric="key"):
+                       restore_dense, receiver="max_norm", bsm_match_metric="key",
+                       bsm_partition="positional"):
     """Mutate model.merge_config in place and (re)bind the right merger.
 
     Re-runs normalize_merge_config so the strategy's validation (multi-layer
@@ -105,6 +106,7 @@ def apply_merge_config(model, *, enabled, strategy, merge_layers, merge_ratio,
         "profile": True,                 # enables per-segment timing in forward()
         "importance_source": "none",     # BSM K/hidden-cosine needs no importance
         "bsm_match_metric": str(bsm_match_metric),
+        "bsm_partition": str(bsm_partition),
     }
     model.merge_config = normalize_merge_config(cfg)   # may raise ValueError
     merger_cls = ensure_token_merger(model)
@@ -326,6 +328,11 @@ def main():
                     help="BSM matching metric: 'key' = post-RoPE attention Key "
                          "cosine (SDPA-safe stash, falls back to feature if "
                          "unavailable), 'feature' = block-output hidden cosine")
+    ap.add_argument("--bsm_partition", default="positional",
+                    choices=["positional", "temporal"],
+                    help="BSM bipartite split: 'positional' = ToMe even/odd; "
+                         "'temporal' = even/odd by tubelet so tokens merge ACROSS "
+                         "time (exploits inter-frame redundancy; single merge layer)")
 
     ap.add_argument("--repeats", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)
@@ -418,7 +425,8 @@ def main():
                 merger_cls = apply_merge_config(
                     model, enabled=True, strategy=cfg["strategy"],
                     merge_layers=cfg["merge_layers"], merge_ratio=ratio,
-                    restore_dense=False, bsm_match_metric=args.bsm_match_metric)
+                    restore_dense=False, bsm_match_metric=args.bsm_match_metric,
+                    bsm_partition=args.bsm_partition)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if not args.allow_fallback:

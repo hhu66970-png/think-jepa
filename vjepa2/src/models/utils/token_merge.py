@@ -39,6 +39,11 @@ class MergeConfig:
     # cosine (SDPA-safe stash), "feature" => block-output hidden-feature cosine.
     # Ignored by every other strategy. Defaulted so A/B/C/B2/C2 are unaffected.
     bsm_match_metric: str = "key"
+    # Bipartite partition for bsm_ksim_gradual_vec: "positional" = ToMe even/odd
+    # over token order (within-frame under t-major layout); "temporal" = split by
+    # TUBELET parity so A-tokens match across DIFFERENT time steps (exploits
+    # inter-frame redundancy). Default leaves A/B/C/B2/C2 + existing BSM unchanged.
+    bsm_partition: str = "positional"
 
 
 def normalize_merge_config(config):
@@ -124,6 +129,7 @@ def normalize_merge_config(config):
         similarity_gate_epsilon=float(config.get("similarity_gate_epsilon", 0.01)),
         direction_by_importance=bool(config.get("direction_by_importance", True)),
         bsm_match_metric=str(config.get("bsm_match_metric", "key")),
+        bsm_partition=str(config.get("bsm_partition", "positional")),
     )
     _validate_merge_config(normalized)
     return normalized

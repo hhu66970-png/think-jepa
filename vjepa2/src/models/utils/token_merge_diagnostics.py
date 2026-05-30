@@ -296,8 +296,19 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         # correct whether token_ids is the dense arange (L_start) or an arbitrary
         # survivor subset (layers > L_start).
         pos = torch.arange(num_tokens, device=x.device)
-        a_idx = pos[0::2]                 # [Na]
-        b_idx = pos[1::2]                 # [Nb]
+        if str(getattr(self.config, "bsm_partition", "positional")) == "temporal":
+            # Temporal split: even TUBELET -> A, odd -> B, so each A-token matches
+            # the most-similar token in a DIFFERENT time step (inter-frame merge).
+            # t recovered from ORIGINAL ids (id // tokens_per_frame); exact at a
+            # single merge layer where token_ids == arange.
+            tokens_per_frame = max(1, int(h_grid) * int(w_grid))
+            t_of_pos = (token_ids[0].to(torch.long) // tokens_per_frame)
+            a_mask = (t_of_pos % 2) == 0
+            a_idx = pos[a_mask]            # [Na] even-tubelet positions
+            b_idx = pos[~a_mask]          # [Nb] odd-tubelet positions
+        else:
+            a_idx = pos[0::2]                 # [Na]
+            b_idx = pos[1::2]                 # [Nb]
         na = a_idx.numel()
         nb = b_idx.numel()
         # r cannot exceed the number of A-tokens (each A contributes <=1 edge).
