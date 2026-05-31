@@ -279,23 +279,6 @@ class VisionTransformer(nn.Module):
                 if attn_j is not None:
                     attn_j._stash_attn_key = bool(bsm_key_metric and j in merge_layer_set)
 
-        # --- RLT-style pre-encoder temporal merge (gated; pre_merge_ratio>0) -------
-        # Collapse temporally-redundant tokens BEFORE block 0 -> before ANY
-        # attention/RoPE-mixing. attn_key=None => merger uses feature-cosine on the
-        # patch-embed output. The merged token then traverses ALL blocks as one token
-        # (max speedup) with a single RoPE position, avoiding the failure mode of
-        # feature-space temporal merge at L2+ (where RoPE already tagged each tubelet
-        # with a distinct time position). Default 0.0 => this block is skipped.
-        if merge_enabled and float(getattr(self.merge_config, "pre_merge_ratio", 0.0)) > 0.0:
-            x, token_ids, token_size, rep_for_orig, pinfo = self.token_merger(
-                x=x, token_ids=token_ids, token_size=token_size,
-                rep_for_orig=rep_for_orig, t_grid=T, h_grid=H_patches,
-                w_grid=W_patches, attn_key=None,
-            )
-            pinfo["layer"] = -1
-            pinfo["pre_merge"] = True
-            merge_infos.append(pinfo)
-
         # Fwd prop
         outs = []
         block_segment_start = _profile_now(profile_device, profile_enabled)

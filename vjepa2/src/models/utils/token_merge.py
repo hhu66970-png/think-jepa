@@ -39,18 +39,6 @@ class MergeConfig:
     # cosine (SDPA-safe stash), "feature" => block-output hidden-feature cosine.
     # Ignored by every other strategy. Defaulted so A/B/C/B2/C2 are unaffected.
     bsm_match_metric: str = "key"
-    # Bipartite partition for bsm_ksim_gradual_vec: "positional" = ToMe even/odd
-    # over token order (within-frame under t-major layout); "temporal" = split by
-    # TUBELET parity so A-tokens match across DIFFERENT time steps (exploits
-    # inter-frame redundancy). Default leaves A/B/C/B2/C2 + existing BSM unchanged.
-    bsm_partition: str = "positional"
-    # >0 enables a single RLT-style temporal merge BEFORE block 0 (pre-encoder),
-    # collapsing this fraction of tokens before any attention/RoPE-mixing.
-    # merge_layers should be empty in this mode. Default 0.0 = off (main path unchanged).
-    pre_merge_ratio: float = 0.0
-    # >0: protect this fraction of most-salient A-tokens (by feature L2 norm) from
-    # being merged in BSM (PiToMe/Rep-Shift-style protection; SDPA-safe). 0 = off.
-    bsm_protect_ratio: float = 0.0
 
 
 def normalize_merge_config(config):
@@ -136,9 +124,6 @@ def normalize_merge_config(config):
         similarity_gate_epsilon=float(config.get("similarity_gate_epsilon", 0.01)),
         direction_by_importance=bool(config.get("direction_by_importance", True)),
         bsm_match_metric=str(config.get("bsm_match_metric", "key")),
-        bsm_partition=str(config.get("bsm_partition", "positional")),
-        pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
-        bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
     )
     _validate_merge_config(normalized)
     return normalized
