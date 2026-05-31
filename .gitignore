@@ -58,3 +58,11 @@ slurm-*.out
 slurm-*.err
 
 .DS_Store
+
+# --- token-merge research scratch / local assets (cleanup 20260531) ---
+*.bak*
+backups_*/
+tmp_token_merge_sync/
+tmp_refactor_verify/*.json
+inputs/
+*.webm
