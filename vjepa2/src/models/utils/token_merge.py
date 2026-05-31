@@ -48,6 +48,9 @@ class MergeConfig:
     # collapsing this fraction of tokens before any attention/RoPE-mixing.
     # merge_layers should be empty in this mode. Default 0.0 = off (main path unchanged).
     pre_merge_ratio: float = 0.0
+    # >0: protect this fraction of most-salient A-tokens (by feature L2 norm) from
+    # being merged in BSM (PiToMe/Rep-Shift-style protection; SDPA-safe). 0 = off.
+    bsm_protect_ratio: float = 0.0
 
 
 def normalize_merge_config(config):
@@ -135,6 +138,7 @@ def normalize_merge_config(config):
         bsm_match_metric=str(config.get("bsm_match_metric", "key")),
         bsm_partition=str(config.get("bsm_partition", "positional")),
         pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
+        bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
     )
     _validate_merge_config(normalized)
     return normalized

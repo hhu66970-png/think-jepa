@@ -330,6 +330,18 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         scores = torch.bmm(a_metric, b_metric.transpose(1, 2))
         # each A-token -> most similar B-token
         best_sim, best_b_local = scores.max(dim=2)   # [B, Na], [B, Na]
+        # -- Optional protection (gated; bsm_protect_ratio>0): keep the most salient
+        # A-tokens (feature L2 norm, SDPA-safe) from being merged away, by forcing
+        # their best-match score to -inf so topk(r) never selects them as sources.
+        _prot = float(getattr(self.config, "bsm_protect_ratio", 0.0))
+        if _prot > 0.0:
+            n_prot = int(math.floor(na * _prot))
+            if n_prot > 0:
+                a_norm = torch.linalg.norm(x.float(), dim=-1).index_select(1, a_idx)  # [B, Na]
+                prot_local = a_norm.topk(min(n_prot, na), dim=1).indices               # [B, n_prot]
+                neg_src = torch.full((batch_size, prot_local.shape[1]), float("-inf"),
+                                     device=x.device, dtype=best_sim.dtype)
+                best_sim = best_sim.scatter(1, prot_local, neg_src)
         # keep the r strongest A->B edges per sample (top-r over A-tokens). r is a
         # single scalar across the batch, so exactly r sources are dropped per
         # sample -> x_new stays a dense [B, N-r, D] (same invariant A/B/C rely on).

@@ -88,7 +88,8 @@ def ensure_token_merger(model):
 
 def apply_merge_config(model, *, enabled, strategy, merge_layers, merge_ratio,
                        restore_dense, receiver="max_norm", bsm_match_metric="key",
-                       bsm_partition="positional", pre_merge_ratio=0.0):
+                       bsm_partition="positional", pre_merge_ratio=0.0,
+                       bsm_protect_ratio=0.0):
     """Mutate model.merge_config in place and (re)bind the right merger.
 
     Re-runs normalize_merge_config so the strategy's validation (multi-layer
@@ -108,6 +109,7 @@ def apply_merge_config(model, *, enabled, strategy, merge_layers, merge_ratio,
         "bsm_match_metric": str(bsm_match_metric),
         "bsm_partition": str(bsm_partition),
         "pre_merge_ratio": float(pre_merge_ratio),
+        "bsm_protect_ratio": float(bsm_protect_ratio),
     }
     model.merge_config = normalize_merge_config(cfg)   # may raise ValueError
     merger_cls = ensure_token_merger(model)
@@ -348,6 +350,9 @@ def main():
     ap.add_argument("--pre_merge_ratios", default="",
                     help="comma list of ratios for RLT-style pre-encoder temporal "
                          "merge (one merge before block 0); use with --bsm_partition temporal")
+    ap.add_argument("--bsm_protect_ratio", type=float, default=0.0,
+                    help="protect this fraction of most-salient A-tokens (feature-norm) "
+                         "from BSM merging (PiToMe/Rep-Shift-style protection; SDPA-safe)")
 
     ap.add_argument("--repeats", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)
@@ -442,7 +447,8 @@ def main():
                     merge_layers=cfg["merge_layers"], merge_ratio=ratio,
                     restore_dense=False, bsm_match_metric=args.bsm_match_metric,
                     bsm_partition=args.bsm_partition,
-                    pre_merge_ratio=cfg.get("pre_merge_ratio", 0.0))
+                    pre_merge_ratio=cfg.get("pre_merge_ratio", 0.0),
+                    bsm_protect_ratio=getattr(args, "bsm_protect_ratio", 0.0))
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if not args.allow_fallback:
