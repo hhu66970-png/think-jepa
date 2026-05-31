@@ -44,6 +44,10 @@ class MergeConfig:
     # TUBELET parity so A-tokens match across DIFFERENT time steps (exploits
     # inter-frame redundancy). Default leaves A/B/C/B2/C2 + existing BSM unchanged.
     bsm_partition: str = "positional"
+    # >0 enables a single RLT-style temporal merge BEFORE block 0 (pre-encoder),
+    # collapsing this fraction of tokens before any attention/RoPE-mixing.
+    # merge_layers should be empty in this mode. Default 0.0 = off (main path unchanged).
+    pre_merge_ratio: float = 0.0
 
 
 def normalize_merge_config(config):
@@ -130,6 +134,7 @@ def normalize_merge_config(config):
         direction_by_importance=bool(config.get("direction_by_importance", True)),
         bsm_match_metric=str(config.get("bsm_match_metric", "key")),
         bsm_partition=str(config.get("bsm_partition", "positional")),
+        pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
     )
     _validate_merge_config(normalized)
     return normalized

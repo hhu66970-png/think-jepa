@@ -255,7 +255,12 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         # r = tokens to remove THIS layer. Same per-layer ratio cap (<=25%) as the
         # 2x2 path; also cap at floor((N-1)/2) so the alternating A/B split always
         # has a partner for every kept A-token and at least one token survives.
-        ratio = max(0.0, min(self.config.merge_ratio, 0.25))
+        # Per-call removal cap. 0.25 is the conservative default for per-layer BSM;
+        # the RLT-style pre-encoder merge (pre_merge_ratio>0) may collapse up to half
+        # the tokens in one shot (bipartite A=N/2 allows it; the (N-1)//2 line below
+        # still bounds it). Gated so per-layer BSM and A/B/C are unaffected.
+        _bsm_cap = 0.5 if float(getattr(self.config, "pre_merge_ratio", 0.0)) > 0.0 else 0.25
+        ratio = max(0.0, min(self.config.merge_ratio, _bsm_cap))
         r = int(math.floor(num_tokens * ratio))
         r = min(r, (num_tokens - 1) // 2)
         if r <= 0 or num_tokens < 2:
