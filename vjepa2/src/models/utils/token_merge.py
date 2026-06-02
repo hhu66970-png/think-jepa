@@ -54,6 +54,16 @@ class MergeConfig:
     bsm_partition: str = "positional"
     pre_merge_ratio: float = 0.0
     bsm_protect_ratio: float = 0.0
+    # WAM (World-model-Aware Merging, strategy=bsm_taware_gradual_vec): a
+    # task-relevance GATE on top of K-BSM. relevance_source="motion" => per-token
+    # adjacent-frame feature change (movers=relevant); "none" => off (==K-BSM).
+    # relevance_lambda in [0,1] scales the gate (0=off, 1=full). The merge top-r
+    # PRIORITY of every edge is multiplied by (1-lam*rel)^power for BOTH its source
+    # and its chosen receiver, so high-relevance (motion/hand) tokens are merged
+    # LAST. Partner CHOICE is unchanged. Ignored by all non-taware strategies.
+    relevance_source: str = "none"
+    relevance_lambda: float = 1.0
+    relevance_power: float = 1.0
 
 
 def normalize_merge_config(config):
@@ -84,6 +94,7 @@ def normalize_merge_config(config):
     grid_agnostic_multilayer_strategies = (
         "bsm_ksim_gradual_vec",
         "bsm_pitome_gradual_vec",   # NEW: same multi-layer allowance as K-BSM
+        "bsm_taware_gradual_vec",   # WAM: K-BSM + task-relevance gate, multi-layer
     )
     if (
         strategy in vectorized_strategies
@@ -146,6 +157,9 @@ def normalize_merge_config(config):
         bsm_partition=str(config.get("bsm_partition", "positional")),
         pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
         bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
+        relevance_source=str(config.get("relevance_source", "none")),
+        relevance_lambda=float(config.get("relevance_lambda", 1.0)),
+        relevance_power=float(config.get("relevance_power", 1.0)),
     )
     _validate_merge_config(normalized)
     return normalized
@@ -324,7 +338,9 @@ class LocalTokenMerger(nn.Module):
         # DiagnosticTokenMerger and the strategy name is registered ONLY in that
         # subclass's VECTORIZED_STRATEGIES, so the base LocalTokenMerger raises
         # "Unsupported merge strategy" above and never reaches this branch.
-        if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec"):
+        if self.config.strategy in (
+            "bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec",
+        ):
             return self._forward_bsm(
                 x, token_ids, token_size, rep_for_orig,
                 int(t_grid), int(h_grid), int(w_grid), attn_key,

@@ -20,7 +20,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from src.models.utils.token_merge import LocalTokenMerger
+from src.models.utils.token_merge import LocalTokenMerger, compute_importance
 
 
 class DiagnosticTokenMerger(LocalTokenMerger):
@@ -33,10 +33,12 @@ class DiagnosticTokenMerger(LocalTokenMerger):
     VECTORIZED_STRATEGIES = LocalTokenMerger.VECTORIZED_STRATEGIES + (
         "bsm_ksim_gradual_vec",  # Gradual K-BSM (grid-agnostic, multi-layer)
         "bsm_pitome_gradual_vec",  # NEW: PiToMe energy-score partition
+        "bsm_taware_gradual_vec",  # WAM: K-BSM + task-relevance (motion) gate
     )
     NO_PYTHON_FALLBACK_STRATEGIES = LocalTokenMerger.NO_PYTHON_FALLBACK_STRATEGIES + (
         "bsm_ksim_gradual_vec",  # must never hit the 2x2 Python fallback path
         "bsm_pitome_gradual_vec",  # NEW: never hit the 2x2 Python fallback
+        "bsm_taware_gradual_vec",  # WAM: never hit the 2x2 Python fallback
     )
 
     def _method_name(self):
@@ -44,6 +46,8 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             return "BSM_ksim_gradual"
         if self.config.strategy == "bsm_pitome_gradual_vec":
             return "BSM_pitome_energy"
+        if self.config.strategy == "bsm_taware_gradual_vec":
+            return "BSM_taware_motion"
         return super()._method_name()
 
     # Gradual K-BSM: global bipartite soft matching (training-free, SDPA-safe).
@@ -182,12 +186,40 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             return x, token_ids, token_size, rep_for_orig, info
         r = r_eff
 
-        # keep the r strongest A->B edges per sample (top-r over A-tokens). r is a
+        # -- WAM task-relevance gate (NEW; bsm_taware_gradual_vec only) -------
+        # Down-weight the merge PRIORITY of any edge touching a high-relevance
+        # (e.g. high-motion / task-relevant) token, so such tokens are dropped
+        # LAST. Partner CHOICE (best_b_local) is UNCHANGED — only which edges the
+        # top-r selects changes. relevance_lambda=0 / strategy!=taware => identical
+        # to K-BSM (rank_score == best_sim).
+        rank_score = best_sim
+        rel_source_used = None
+        if self.config.strategy == "bsm_taware_gradual_vec":
+            lam = float(getattr(self.config, "relevance_lambda", 1.0))
+            if lam > 0.0:
+                rel = self._wam_relevance(x, token_ids, rep_for_orig,
+                                          int(t_grid), int(h_grid), int(w_grid))  # [B,N] in [0,1]
+                rel_source_used = str(getattr(self.config, "relevance_source", "motion") or "motion")
+                pw = float(getattr(self.config, "relevance_power", 1.0))
+                gate = (1.0 - lam * rel).clamp(0.0, 1.0).pow(pw)        # [B, N]
+                if a_idx.dim() == 2:
+                    gate_a = gate.gather(1, a_idx)                      # [B, Na]
+                    gate_b_all = gate.gather(1, b_idx)                  # [B, Nb]
+                else:
+                    gate_a = gate.index_select(1, a_idx)               # [B, Na]
+                    gate_b_all = gate.index_select(1, b_idx)           # [B, Nb]
+                gate_b_chosen = gate_b_all.gather(1, best_b_local)    # [B, Na]
+                gated = best_sim * gate_a * gate_b_chosen
+                # keep axis-masked (-inf) rows at -inf (avoid -inf*0=nan promotion)
+                rank_score = torch.where(torch.isfinite(best_sim), gated, best_sim)
+
+        # keep the r strongest A->B edges per sample (top-r by rank_score). r is a
         # single scalar across the batch -> exactly r sources dropped per sample
         # -> x_new stays a dense [B, N-r, D] (the invariant A/B/C rely on). Every
         # selected edge is finite because r <= #valid rows.
-        edge_sim, edge_a_local = best_sim.topk(r, dim=1)        # [B, r]
+        _, edge_a_local = rank_score.topk(r, dim=1)             # [B, r]
         edge_b_local = best_b_local.gather(1, edge_a_local)     # [B, r]
+        edge_sim = best_sim.gather(1, edge_a_local)             # [B, r] ACTUAL cosine
 
         # map A/B local indices back to ABSOLUTE token positions (per-sample or
         # shared, mirroring the a_idx/b_idx shape handled above).
@@ -266,6 +298,9 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         info["matching_metric"] = match_metric
         info["bsm_partition"] = partition_name
         info["merge_axis"] = axis
+        if rel_source_used is not None:
+            info["relevance_source"] = rel_source_used
+            info["relevance_lambda"] = float(getattr(self.config, "relevance_lambda", 1.0))
         if energy_a is not None:
             e = energy_a.detach().float()
             info["pitome_energy_mean"] = float(e.mean().item())
@@ -412,3 +447,50 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         scores_masked = scores.masked_fill(~allowed, neg_inf)
         a_valid_row = allowed.any(dim=2)                          # [B, Na]
         return scores_masked, a_valid_row
+
+    # ---------------------------------------------------------------------
+    # NEW HELPER 3 — WAM per-token task relevance (motion saliency).
+    # ---------------------------------------------------------------------
+    @torch.no_grad()
+    def _wam_relevance(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
+        """Per-CURRENT-token task relevance in [0,1] (1 = protect hardest).
+
+        Computed ONCE at the first merge layer (where N == num_original == t*h*w)
+        as adjacent-frame feature change (motion); cached per ORIGINAL token id.
+        At later (already-compressed) layers we GATHER the cached relevance by the
+        current tokens' original ids (token_ids), since N != t*h*w there and the
+        grid reshape in compute_importance would be invalid. Each layer is then
+        per-sample min-max normalized to [0,1] (max -> 1) so the gate is consistent.
+
+        relevance_source="motion" => compute_importance(..., "motion"); other
+        sources fall through to the same motion default for now (V1).
+        """
+        batch_size, num_tokens, _ = x.shape
+        num_original = int(rep_for_orig.shape[1])
+        source = str(getattr(self.config, "relevance_source", "motion") or "motion")
+        if source == "none":
+            source = "motion"
+
+        def _unit01(rel):
+            rel = rel.float().clamp_min(0.0)
+            rel = rel / rel.amax(dim=1, keepdim=True).clamp_min(1e-6)
+            return rel
+
+        # First merge layer: dense grid -> compute & cache (token_ids == arange,
+        # so the per-current-token vector IS indexed by original id).
+        if num_tokens == num_original and num_tokens == int(t_grid * h_grid * w_grid):
+            rel = compute_importance(x, int(t_grid), int(h_grid), int(w_grid),
+                                     "motion" if source not in ("norm", "norm_motion",
+                                                                "qk_global_hidden") else source)
+            if rel is None:
+                rel = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
+            self._wam_rel_orig = rel.detach().float()              # [B, num_original]
+            return _unit01(rel)
+
+        # Later layers: gather cached relevance by current tokens' original ids.
+        cache = getattr(self, "_wam_rel_orig", None)
+        if (cache is not None and cache.shape[0] == batch_size
+                and cache.shape[1] == num_original):
+            return _unit01(cache.gather(1, token_ids))
+        # Fallback: no cache (first merge layer wasn't dense) -> no protection.
+        return torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
