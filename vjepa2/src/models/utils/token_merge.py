@@ -494,7 +494,7 @@ class LocalTokenMerger(nn.Module):
         # it can run on already-compressed token sets at every merge layer. (The
         # forward() dispatch routes bsm before this is reached; this guard is a
         # defensive no-op for that strategy.)
-        if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec"):
+        if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec"):
             return True, None
         expected_tokens = int(t_grid * h_grid * w_grid)
         if h_grid % 2 != 0 or w_grid % 2 != 0:

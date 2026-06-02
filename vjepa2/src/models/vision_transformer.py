@@ -273,7 +273,7 @@ class VisionTransformer(nn.Module):
         bsm_key_metric = (
             merge_enabled
             and getattr(self.merge_config, "strategy", "")
-            in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec")
+            in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec")
             and getattr(self.merge_config, "bsm_match_metric", "key") == "key"
         )
         if merge_enabled:
