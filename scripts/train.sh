@@ -165,6 +165,12 @@ fi
 if [[ -n "${TEST_MANIFEST}" ]]; then
   CMD+=(--test_manifest "${TEST_MANIFEST}")
 fi
+if [[ "${FROZEN_PREDICTOR:-0}" == "1" ]]; then
+  CMD+=(--frozen_predictor)
+fi
+if [[ -n "${PREDICTOR_CKPT:-}" ]]; then
+  CMD+=(--predictor_ckpt "${PREDICTOR_CKPT}")
+fi
 
 echo "[INFO] ROOT_DIR=${ROOT_DIR}"
 echo "[INFO] OUT_DIR=${OUT_DIR}"

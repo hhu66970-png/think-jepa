@@ -267,9 +267,13 @@ class VisionTransformer(nn.Module):
         # Every other strategy leaves the flag unset so attention is byte-for-byte
         # unchanged. (RoPEAttention.forward reads getattr(self, "_stash_attn_key",
         # False) and pays nothing when it is False.)
+        # Both grid-agnostic BSM strategies use the post-RoPE Key cosine metric;
+        # arm the stash for K-BSM AND PiToMe (energy partition still matches/merges
+        # on the Key, identical to K-BSM). Any other strategy leaves the flag unset.
         bsm_key_metric = (
             merge_enabled
-            and getattr(self.merge_config, "strategy", "") == "bsm_ksim_gradual_vec"
+            and getattr(self.merge_config, "strategy", "")
+            in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec")
             and getattr(self.merge_config, "bsm_match_metric", "key") == "key"
         )
         if merge_enabled:

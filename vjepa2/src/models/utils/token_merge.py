@@ -39,6 +39,21 @@ class MergeConfig:
     # cosine (SDPA-safe stash), "feature" => block-output hidden-feature cosine.
     # Ignored by every other strategy. Defaulted so A/B/C/B2/C2 are unaffected.
     bsm_match_metric: str = "key"
+    # Axis constraint for the BSM family (bsm_ksim_gradual_vec /
+    # bsm_pitome_gradual_vec). free=no constraint (default, unchanged);
+    # spatial=only same-frame merges; temporal=only cross-frame merges.
+    # Frame = original_id // (h_grid*w_grid). Ignored by non-BSM strategies.
+    merge_axis: str = "free"
+    # PiToMe energy margin m: energy_i = mean_j relu(cos(i,j)-m). 0.0 => mean cos.
+    pitome_margin: float = 0.0
+    # PiToMe energy anchor budget. If N > this, energy uses N x anchors subsample
+    # (O(N*anchors)); <=0 => always full O(N^2).
+    pitome_energy_max_anchors: int = 2048
+    # Pre-existing harness fields, currently MISSING from the dataclass+normalizer
+    # (run_token_merge_pca_experiment.py passes them; today they are dropped).
+    bsm_partition: str = "positional"
+    pre_merge_ratio: float = 0.0
+    bsm_protect_ratio: float = 0.0
 
 
 def normalize_merge_config(config):
@@ -68,6 +83,7 @@ def normalize_merge_config(config):
     # documents intent and stays robust if it is ever added to the tuple above.
     grid_agnostic_multilayer_strategies = (
         "bsm_ksim_gradual_vec",
+        "bsm_pitome_gradual_vec",   # NEW: same multi-layer allowance as K-BSM
     )
     if (
         strategy in vectorized_strategies
@@ -124,6 +140,12 @@ def normalize_merge_config(config):
         similarity_gate_epsilon=float(config.get("similarity_gate_epsilon", 0.01)),
         direction_by_importance=bool(config.get("direction_by_importance", True)),
         bsm_match_metric=str(config.get("bsm_match_metric", "key")),
+        merge_axis=str(config.get("merge_axis", "free")),
+        pitome_margin=float(config.get("pitome_margin", 0.0)),
+        pitome_energy_max_anchors=int(config.get("pitome_energy_max_anchors", 2048)),
+        bsm_partition=str(config.get("bsm_partition", "positional")),
+        pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
+        bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
     )
     _validate_merge_config(normalized)
     return normalized
@@ -152,6 +174,12 @@ def _validate_merge_config(config):
                 "local_keep_then_merge_vec with an importance-based keep_source requires "
                 "importance_source != 'none'."
             )
+    if config.merge_axis not in ("free", "spatial", "temporal"):
+        raise ValueError(
+            f"merge_axis must be one of free|spatial|temporal, got {config.merge_axis!r}"
+        )
+    if config.strategy == "bsm_pitome_gradual_vec" and config.pitome_margin < 0.0:
+        raise ValueError("pitome_margin must be >= 0.0")
 
 
 def _normalize_per_sample(score, eps=1e-6):
@@ -296,7 +324,7 @@ class LocalTokenMerger(nn.Module):
         # DiagnosticTokenMerger and the strategy name is registered ONLY in that
         # subclass's VECTORIZED_STRATEGIES, so the base LocalTokenMerger raises
         # "Unsupported merge strategy" above and never reaches this branch.
-        if self.config.strategy == "bsm_ksim_gradual_vec":
+        if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec"):
             return self._forward_bsm(
                 x, token_ids, token_size, rep_for_orig,
                 int(t_grid), int(h_grid), int(w_grid), attn_key,
@@ -450,7 +478,7 @@ class LocalTokenMerger(nn.Module):
         # it can run on already-compressed token sets at every merge layer. (The
         # forward() dispatch routes bsm before this is reached; this guard is a
         # defensive no-op for that strategy.)
-        if self.config.strategy == "bsm_ksim_gradual_vec":
+        if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec"):
             return True, None
         expected_tokens = int(t_grid * h_grid * w_grid)
         if h_grid % 2 != 0 or w_grid % 2 != 0:

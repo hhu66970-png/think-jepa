@@ -81,6 +81,20 @@ from cache_train.predictor import PatchwiseAutoregressiveRolloutHead
 from vjepa2.src.models.predictor import VisionTransformerPredictor  # NEW
 from vjepa2.src.models.vision_transformer import vit_large_rope
 
+# --- temporal-audit metrics (A1/A2/A3); additive, no effect unless called ---
+# Sibling module dropped next to this file in cache_train/ (cache_train is on
+# sys.path via the loop above). Guarded so an absent module never breaks import.
+try:
+    from eval_temporal_metrics import (
+        summarize_temporal_metrics as _summarize_temporal_metrics,
+    )
+
+    _HAS_TEMPORAL_METRICS = True
+except Exception as _e_tm:  # pragma: no cover - keeps file import-safe
+    _summarize_temporal_metrics = None
+    _HAS_TEMPORAL_METRICS = False
+    _TEMPORAL_METRICS_IMPORT_ERROR = _e_tm
+
 
 def configure_reproducibility_seed(seed=42):
     random.seed(seed)
@@ -1978,6 +1992,14 @@ def main(args):
     configure_dense_jepa_cudnn()
 
     num_epoch = int(getattr(args, "epochs", 300))
+    # --- A3 frozen-predictor eval-only mode ---
+    # When set: a single pass that builds+loads the dense predictor, freezes it,
+    # and runs ONLY the eval block (train body / optimizers / saves are gated off
+    # below). Measures the dense predictor on the current (merge) features.
+    frozen_eval = bool(getattr(args, "frozen_predictor", False))
+    _frozen_loaded = False
+    if frozen_eval:
+        num_epoch = 1
     use_amp = (not getattr(args, "no_amp", False)) and device.type == "cuda"
     grad_accum_steps = int(getattr(args, "grad_accum", 1))
     temporal_stride = max(1, int(getattr(args, "temporal_stride", 1)))
@@ -2218,7 +2240,9 @@ def main(args):
     resume_optimizer_pred_state = None
     resume_predictor_loaded = False
     start_epoch = 0
-    if resume_ckpt_path is not None:
+    # A3: in frozen-predictor eval mode, never resume (weights come from
+    # --predictor_ckpt instead, loaded just-in-time after the predictor is built).
+    if resume_ckpt_path is not None and not frozen_eval:
         resume_blob = torch_load_checkpoint(resume_ckpt_path, map_location="cpu")
         ckpt_epoch = int(resume_blob.get("epoch", 0))
         if ckpt_epoch < 0:
@@ -2581,6 +2605,55 @@ def main(args):
                                 "[INFO] loaded predictor/optimizer_pred state from resume checkpoint"
                             )
 
+            # ==== A3: frozen-predictor load + skip training ====
+            # The predictor is built lazily just above on the first train batch.
+            # In frozen mode we now (a) load dense-trained predictor+cls_model
+            # weights, (b) freeze them, (c) break out of the train loop so NO
+            # forward/backward/optimizer ever runs. The eval block below then runs
+            # this frozen path on the current (possibly merged) features.
+            if frozen_eval:
+                if not _frozen_loaded:
+                    ckpt_path = str(getattr(args, "predictor_ckpt", "") or "")
+                    if not ckpt_path:
+                        raise ValueError(
+                            "--frozen_predictor requires --predictor_ckpt <path>"
+                        )
+                    blob = torch_load_checkpoint(ckpt_path, map_location="cpu")
+                    if use_pred and (predictor is not None):
+                        if "predictor" not in blob:
+                            raise KeyError(
+                                f"--predictor_ckpt has no 'predictor' state: {ckpt_path}"
+                            )
+                        unwrap_ddp_module(predictor).load_state_dict(
+                            blob["predictor"], strict=True
+                        )
+                        for p in predictor.parameters():
+                            p.requires_grad_(False)
+                        predictor.eval()
+                    # Load the dense-trained readout head too, so the WHOLE
+                    # downstream path is the dense one (a fresh cls_model would
+                    # contaminate the measurement).
+                    if "cls_model" not in blob:
+                        raise KeyError(
+                            f"--predictor_ckpt has no 'cls_model' state: {ckpt_path}"
+                        )
+                    unwrap_ddp_module(cls_model).load_state_dict(
+                        blob["cls_model"], strict=True
+                    )
+                    for p in cls_model.parameters():
+                        p.requires_grad_(False)
+                    cls_model.eval()
+                    _frozen_loaded = True
+                    if is_primary_process(rank):
+                        print(
+                            f"[INFO][A3] frozen-predictor eval: loaded predictor"
+                            f"{'+cls_model' if (use_pred and predictor is not None) else ' (none)+cls_model'} "
+                            f"from {ckpt_path}; training skipped.",
+                            flush=True,
+                        )
+                # Stop iterating the train loader: frozen mode does NOT train.
+                break
+
             # ==== predictor forward (build pred_loss & feats_task_in) ====
             pred_metrics = {
                 "pred_loss": torch.tensor(0.0, device=device),
@@ -2932,7 +3005,7 @@ def main(args):
         if is_primary_process(rank):
             pbar.close()
 
-        if accum_steps > 0:
+        if (not frozen_eval) and accum_steps > 0:
             if use_amp:
                 scaler.step(optimizer)
                 if (args.predictor != "none") and (optimizer_pred is not None):
@@ -2954,6 +3027,17 @@ def main(args):
         test_lat_metric_sums = initialize_latent_metric_totals()
         test_count = 0
         test_pred_count = 0
+
+        # --- A1/A2 temporal-audit accumulators (per-batch sums; divide later) ---
+        # Additive: only populated when the metrics module imported successfully.
+        temporal_step_sum = None          # list[future_T], lazily sized
+        temporal_vel_step_sum = None      # list[future_T-1]
+        temporal_acc_step_sum = None      # list[future_T-2]
+        temporal_step_count = 0
+        temporal_vel_sum = 0.0
+        temporal_vel_final_sum = 0.0
+        temporal_acc_sum = 0.0
+        temporal_acc_final_sum = 0.0
 
         with torch.no_grad():
             itr_test = iter(test_loader)
@@ -3253,6 +3337,42 @@ def main(args):
                 test_avgdist_sum += float(avg_dist.mean().item())
                 test_finaldist_sum += float(final_dist.mean().item())
                 test_count += 1
+
+                # --- A1/A2 temporal audit (per-batch); additive, fully guarded ---
+                # pred_world / xyz_world_slice are [B, future_T, num_joints, 3]
+                # (pred_cam.view(B, Tpred, J, 3) above; xyz_world_slice from
+                # xyz_world[:, f0:f1, ...]). coord_dim=3 matches that .view(...,3).
+                # No joint subset here, matching the thr=0.05 call above (all joints).
+                if _HAS_TEMPORAL_METRICS:
+                    try:
+                        _tm = _summarize_temporal_metrics(
+                            pred_world, xyz_world_slice, coord_dim=3, dt=1.0
+                        )
+                        _T = len(_tm["per_step_displacement"])
+                        if temporal_step_sum is None and _T > 0:
+                            temporal_step_sum = [0.0] * _T
+                            temporal_vel_step_sum = [0.0] * max(0, _T - 1)
+                            temporal_acc_step_sum = [0.0] * max(0, _T - 2)
+                        if _T > 0 and len(temporal_step_sum) == _T:
+                            for _i, _v in enumerate(_tm["per_step_displacement"]):
+                                temporal_step_sum[_i] += _v
+                            for _i, _v in enumerate(_tm["velocity_error_per_step"]):
+                                temporal_vel_step_sum[_i] += _v
+                            for _i, _v in enumerate(_tm["accel_error_per_step"]):
+                                temporal_acc_step_sum[_i] += _v
+                            temporal_step_count += 1
+                        temporal_vel_sum += _tm["velocity_error"]
+                        temporal_vel_final_sum += _tm["velocity_error_final"]
+                        temporal_acc_sum += _tm["accel_error"]
+                        temporal_acc_final_sum += _tm["accel_error_final"]
+                    except Exception as _ex_tm:
+                        if is_primary_process(rank):
+                            print(
+                                f"[WARN] temporal-audit metric failed on a batch: "
+                                f"{type(_ex_tm).__name__}: {_ex_tm}",
+                                flush=True,
+                            )
+
                 if pred_metric_valid:
                     for key in test_lat_metric_sums:
                         test_lat_metric_sums[key] += float(
@@ -3392,7 +3512,8 @@ def main(args):
             )
 
         latest_path = out_dir / "ckpt_latest.pt"
-        if is_primary_process(rank):
+        # A3: frozen eval is measurement-only — never write checkpoints.
+        if is_primary_process(rank) and not frozen_eval:
             try:
                 save_training_checkpoint(
                     latest_path,
@@ -3414,7 +3535,7 @@ def main(args):
                 )
 
         is_best = avg_test_avgdist < best_ade
-        if is_primary_process(rank) and is_best:
+        if is_primary_process(rank) and is_best and not frozen_eval:
             best_ade = avg_test_avgdist
             best_epoch = epoch + 1
             best_path = out_dir / "ckpt_best.pt"
@@ -3453,6 +3574,30 @@ def main(args):
                 )
 
         if is_primary_process(rank):
+            # --- reduce A1/A2 over the epoch (batch-weighted, like ADE/FDE) ---
+            # Per-step curves divide by the curve-batch count (temporal_step_count);
+            # overall scalars divide by test_count, matching ADE/FDE averaging.
+            _tc = max(temporal_step_count, 1)
+            _bc = max(test_count, 1)
+            per_step_disp = (
+                [s / _tc for s in temporal_step_sum] if temporal_step_sum else []
+            )
+            vel_per_step = (
+                [s / _tc for s in temporal_vel_step_sum] if temporal_vel_step_sum else []
+            )
+            acc_per_step = (
+                [s / _tc for s in temporal_acc_step_sum] if temporal_acc_step_sum else []
+            )
+            temporal_block = {
+                "per_step_displacement": per_step_disp,        # [future_T]
+                "velocity_error": temporal_vel_sum / _bc,
+                "velocity_error_final": temporal_vel_final_sum / _bc,
+                "velocity_error_per_step": vel_per_step,        # [future_T-1]
+                "accel_error": temporal_acc_sum / _bc,
+                "accel_error_final": temporal_acc_final_sum / _bc,
+                "accel_error_per_step": acc_per_step,           # [future_T-2]
+                "num_eval_batches": int(test_count),
+            }
             logs["epochs"].append(
                 {
                     "epoch": epoch + 1,
@@ -3483,6 +3628,7 @@ def main(args):
                     "val_acc": avg_test_acc,
                     "val_avg_dist": avg_test_avgdist,
                     "val_final_dist": avg_test_finaldist,
+                    "temporal": temporal_block,  # A1/A2 (backward-compatible extra key)
                     "time_sec": dt,
                     "ckpt": str(latest_path),
                     "is_best": is_best,
@@ -3493,6 +3639,26 @@ def main(args):
             except Exception as ex:
                 print(
                     f"[WARN] failed to save metrics json {metrics_json_path}: {ex}",
+                    flush=True,
+                )
+            # --- A1/A2 sidecar: temporal_metrics.json next to test_results.md ---
+            # Decoupled from metrics.json so dense-vs-merge curves diff cleanly.
+            try:
+                write_json_atomic(
+                    {
+                        "epoch": epoch + 1,
+                        "future_T": int(getattr(args, "future_T", 0)),
+                        "num_joints": (int(J) if "J" in locals() else None),
+                        "frozen_predictor": bool(
+                            getattr(args, "frozen_predictor", False)
+                        ),
+                        **temporal_block,
+                    },
+                    out_dir / "temporal_metrics.json",
+                )
+            except Exception as ex:
+                print(
+                    f"[WARN] failed to save temporal_metrics.json: {ex}",
                     flush=True,
                 )
             try:
@@ -3514,7 +3680,8 @@ def main(args):
                 )
         if ddp:
             torch.distributed.barrier()
-        scheduler.step()
+        if not frozen_eval:
+            scheduler.step()
 
     if is_primary_process(rank):
         latent_plot_path = plot_latent_metric_curves(
@@ -3569,6 +3736,22 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="resume from an explicit checkpoint path instead of auto-discovering the latest epoch checkpoint",
+    )
+    parser.add_argument(
+        "--frozen_predictor",
+        action="store_true",
+        help="EVAL-ONLY (A3): load a dense-trained predictor (and cls_model) from "
+        "--predictor_ckpt, freeze them, and run a single eval pass on the current "
+        "(possibly token-merged) features. No training, no optimizer, no save.",
+    )
+    parser.add_argument(
+        "--predictor_ckpt",
+        type=str,
+        default="",
+        help="path to the DENSE-trained checkpoint (ckpt_best.pt / ckpt_latest.pt) "
+        "whose 'predictor' (and 'cls_model') weights are loaded for "
+        "--frozen_predictor. Must have been trained with the SAME --predictor type "
+        "and architecture hyperparameters.",
     )
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument(

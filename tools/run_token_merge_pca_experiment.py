@@ -87,7 +87,9 @@ def ensure_token_merger(model):
 
 
 def apply_merge_config(model, *, enabled, strategy, merge_layers, merge_ratio,
-                       restore_dense, receiver="max_norm", bsm_match_metric="key"):
+                       restore_dense, receiver="max_norm", bsm_match_metric="key",
+                       merge_axis="free", pitome_margin=0.0,
+                       pitome_energy_max_anchors=2048):
     """Mutate model.merge_config in place and (re)bind the right merger.
 
     Re-runs normalize_merge_config so the strategy's validation (multi-layer
@@ -105,6 +107,9 @@ def apply_merge_config(model, *, enabled, strategy, merge_layers, merge_ratio,
         "profile": True,                 # enables per-segment timing in forward()
         "importance_source": "none",     # BSM K/hidden-cosine needs no importance
         "bsm_match_metric": str(bsm_match_metric),
+        "merge_axis": str(merge_axis),
+        "pitome_margin": float(pitome_margin),
+        "pitome_energy_max_anchors": int(pitome_energy_max_anchors),
     }
     model.merge_config = normalize_merge_config(cfg)   # may raise ValueError
     merger_cls = ensure_token_merger(model)
@@ -326,6 +331,16 @@ def main():
                     help="BSM matching metric: 'key' = post-RoPE attention Key "
                          "cosine (SDPA-safe stash, falls back to feature if "
                          "unavailable), 'feature' = block-output hidden cosine")
+    ap.add_argument("--merge_axis", default="free",
+                    choices=["free", "spatial", "temporal"],
+                    help="BSM axis constraint: free=any, spatial=same-frame only, "
+                         "temporal=cross-frame only")
+    ap.add_argument("--pitome_margin", type=float, default=0.0,
+                    help="PiToMe energy margin m in mean_j relu(cos-m) "
+                         "(bsm_pitome_gradual_vec only)")
+    ap.add_argument("--pitome_energy_max_anchors", type=int, default=2048,
+                    help="PiToMe energy anchor budget; N>this uses NxA subsample, "
+                         "<=0 forces full O(N^2)")
 
     ap.add_argument("--repeats", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)
@@ -418,7 +433,9 @@ def main():
                 merger_cls = apply_merge_config(
                     model, enabled=True, strategy=cfg["strategy"],
                     merge_layers=cfg["merge_layers"], merge_ratio=ratio,
-                    restore_dense=False, bsm_match_metric=args.bsm_match_metric)
+                    restore_dense=False, bsm_match_metric=args.bsm_match_metric,
+                    merge_axis=args.merge_axis, pitome_margin=args.pitome_margin,
+                    pitome_energy_max_anchors=args.pitome_energy_max_anchors)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if not args.allow_fallback:
