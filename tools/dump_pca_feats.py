@@ -33,10 +33,14 @@ import run_token_merge_pca_experiment as E  # noqa: E402
 
 
 @torch.no_grad()
-def forward_capture(model, video, *, enabled, strategy, layers, ratio, metric, capture):
+def forward_capture(model, video, *, enabled, strategy, layers, ratio, metric, capture,
+                    relevance=None):
     """Run one forward (restore_dense=True); return {layer: [N,D] cpu float}, final."""
     E.apply_merge_config(model, enabled=enabled, strategy=strategy, merge_layers=layers,
                          merge_ratio=ratio, restore_dense=True, bsm_match_metric=metric)
+    if relevance is not None:
+        model.merge_config.relevance_source = relevance[0]
+        model.merge_config.relevance_lambda = float(relevance[1])
     if not enabled:
         model.merge_config.enabled = False  # force true dense
     model.out_layers = sorted(capture)
@@ -82,13 +86,15 @@ def main():
     model = E.build_model(args.checkpoint, args.num_frames, args.img_size,
                           args.patch_size, "bsm_ksim_gradual_vec", args.device)
 
-    # (label, enabled, strategy, layers, ratio, metric)
+    # (label, enabled, strategy, layers, ratio, metric, relevance)
     methods = [
-        ("dense",    False, "local_2x2_same_time_vec", [], 0.0, "key"),
+        ("dense",    False, "local_2x2_same_time_vec", [], 0.0, "key", None),
         ("scheme_a", True,  "local_2x2_same_time_vec", [args.scheme_a_layer],
-         args.scheme_a_ratio, "key"),
-        ("kbsm",     True,  "bsm_ksim_gradual_vec", bsm_layers, args.bsm_ratio, "key"),
-        ("pitome",   True,  "bsm_pitome_gradual_vec", bsm_layers, args.bsm_ratio, "key"),
+         args.scheme_a_ratio, "key", None),
+        ("kbsm",     True,  "bsm_ksim_gradual_vec", bsm_layers, args.bsm_ratio, "key", None),
+        ("pitome",   True,  "bsm_pitome_gradual_vec", bsm_layers, args.bsm_ratio, "key", None),
+        ("wam",      True,  "bsm_taware_gradual_vec", bsm_layers, args.bsm_ratio, "key",
+         ("motion", 1.0)),
     ]
 
     for path in clip_paths:
@@ -105,10 +111,11 @@ def main():
                     ref_layer=args.ref_layer, deep_layer=args.deep_layer,
                     input_frame=frame)
         finals = {}
-        for label, en, strat, lays, r, metric in methods:
+        for label, en, strat, lays, r, metric, rel in methods:
             cap = [args.ref_layer, args.deep_layer] if label == "dense" else [args.deep_layer]
             feats, final = forward_capture(model, video, enabled=en, strategy=strat,
-                                           layers=lays, ratio=r, metric=metric, capture=cap)
+                                           layers=lays, ratio=r, metric=metric, capture=cap,
+                                           relevance=rel)
             finals[label] = final
             if label == "dense":
                 save["dense_L5"] = feats[args.ref_layer].half().numpy()

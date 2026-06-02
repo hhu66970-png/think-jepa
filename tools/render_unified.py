@@ -195,8 +195,11 @@ def stack_rows(rows, row_labels, label_w=128, gutter=8):
     return sheet
 
 
+import os as _os
+_WAM = _os.environ.get("INCLUDE_WAM", "0") == "1"
 METHOD_ORDER = [("dense", "dense"), ("scheme_a", "scheme-A"),
-                ("kbsm", "K-BSM"), ("pitome", "PiToMe")]
+                ("kbsm", "K-BSM"), ("pitome", "PiToMe")] + (
+                [("wam", "WAM")] if _WAM else [])
 
 
 def main():
