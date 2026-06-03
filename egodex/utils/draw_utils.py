@@ -199,6 +199,9 @@ def draw_projected_line(pointa, pointb, image, intrinsic, color=(0, 255, 0), thi
 
             u1, v1 = pa[i]
             u2, v2 = pb[i]
+            if not all(np.isfinite(t) for t in (u1, v1, u2, v2)):
+                image[i] = frame
+                continue
 
             inside1 = (0 <= u1 < W) and (0 <= v1 < H)
             inside2 = (0 <= u2 < W) and (0 <= v2 < H)

@@ -35,6 +35,35 @@ class MergeConfig:
     keep_score_beta: float = 0.0
     similarity_gate_epsilon: float = 0.01
     direction_by_importance: bool = True
+    # Matching metric for bsm_ksim_gradual_vec: "key" => post-RoPE attention Key
+    # cosine (SDPA-safe stash), "feature" => block-output hidden-feature cosine.
+    # Ignored by every other strategy. Defaulted so A/B/C/B2/C2 are unaffected.
+    bsm_match_metric: str = "key"
+    # Axis constraint for the BSM family (bsm_ksim_gradual_vec /
+    # bsm_pitome_gradual_vec). free=no constraint (default, unchanged);
+    # spatial=only same-frame merges; temporal=only cross-frame merges.
+    # Frame = original_id // (h_grid*w_grid). Ignored by non-BSM strategies.
+    merge_axis: str = "free"
+    # PiToMe energy margin m: energy_i = mean_j relu(cos(i,j)-m). 0.0 => mean cos.
+    pitome_margin: float = 0.0
+    # PiToMe energy anchor budget. If N > this, energy uses N x anchors subsample
+    # (O(N*anchors)); <=0 => always full O(N^2).
+    pitome_energy_max_anchors: int = 2048
+    # Pre-existing harness fields, currently MISSING from the dataclass+normalizer
+    # (run_token_merge_pca_experiment.py passes them; today they are dropped).
+    bsm_partition: str = "positional"
+    pre_merge_ratio: float = 0.0
+    bsm_protect_ratio: float = 0.0
+    # WAM (World-model-Aware Merging, strategy=bsm_taware_gradual_vec): a
+    # task-relevance GATE on top of K-BSM. relevance_source="motion" => per-token
+    # adjacent-frame feature change (movers=relevant); "none" => off (==K-BSM).
+    # relevance_lambda in [0,1] scales the gate (0=off, 1=full). The merge top-r
+    # PRIORITY of every edge is multiplied by (1-lam*rel)^power for BOTH its source
+    # and its chosen receiver, so high-relevance (motion/hand) tokens are merged
+    # LAST. Partner CHOICE is unchanged. Ignored by all non-taware strategies.
+    relevance_source: str = "none"
+    relevance_lambda: float = 1.0
+    relevance_power: float = 1.0
 
 
 def normalize_merge_config(config):
@@ -57,7 +86,21 @@ def normalize_merge_config(config):
         "local_keep_then_merge_vec",
         "local_2x2_similarity_gated_importance_vec",
     )
-    if strategy in vectorized_strategies and len(layers) > 1:
+    # Grid-agnostic strategies operate on arbitrary (already-compressed) token
+    # sets and are explicitly ALLOWED to merge across MULTIPLE layers. The 2x2
+    # cell strategies above still require a single dense merge layer. bsm is not
+    # in vectorized_strategies, so the guard already skips it; this allow-set
+    # documents intent and stays robust if it is ever added to the tuple above.
+    grid_agnostic_multilayer_strategies = (
+        "bsm_ksim_gradual_vec",
+        "bsm_pitome_gradual_vec",   # NEW: same multi-layer allowance as K-BSM
+        "bsm_taware_gradual_vec",   # WAM: K-BSM + task-relevance gate, multi-layer
+    )
+    if (
+        strategy in vectorized_strategies
+        and strategy not in grid_agnostic_multilayer_strategies
+        and len(layers) > 1
+    ):
         raise ValueError(
             f"{strategy} currently supports exactly one merge layer. "
             "Use a single layer or implement sparse-state vectorized merging before "
@@ -107,6 +150,16 @@ def normalize_merge_config(config):
         keep_score_beta=float(config.get("keep_score_beta", 0.0)),
         similarity_gate_epsilon=float(config.get("similarity_gate_epsilon", 0.01)),
         direction_by_importance=bool(config.get("direction_by_importance", True)),
+        bsm_match_metric=str(config.get("bsm_match_metric", "key")),
+        merge_axis=str(config.get("merge_axis", "free")),
+        pitome_margin=float(config.get("pitome_margin", 0.0)),
+        pitome_energy_max_anchors=int(config.get("pitome_energy_max_anchors", 2048)),
+        bsm_partition=str(config.get("bsm_partition", "positional")),
+        pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
+        bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
+        relevance_source=str(config.get("relevance_source", "none")),
+        relevance_lambda=float(config.get("relevance_lambda", 1.0)),
+        relevance_power=float(config.get("relevance_power", 1.0)),
     )
     _validate_merge_config(normalized)
     return normalized
@@ -135,6 +188,12 @@ def _validate_merge_config(config):
                 "local_keep_then_merge_vec with an importance-based keep_source requires "
                 "importance_source != 'none'."
             )
+    if config.merge_axis not in ("free", "spatial", "temporal"):
+        raise ValueError(
+            f"merge_axis must be one of free|spatial|temporal, got {config.merge_axis!r}"
+        )
+    if config.strategy == "bsm_pitome_gradual_vec" and config.pitome_margin < 0.0:
+        raise ValueError("pitome_margin must be >= 0.0")
 
 
 def _normalize_per_sample(score, eps=1e-6):
@@ -236,12 +295,29 @@ def restore_dense_tokens(x, token_ids, rep_for_orig, num_original_tokens):
 class LocalTokenMerger(nn.Module):
     """Training-free local same-time 2x2 token merging for video ViT tokens."""
 
+    # Vectorized strategies handled on the MAIN path: A (similarity-only),
+    # B (importance-protected), C (hybrid score). The diagnostic-only B2/C2
+    # strategies are intentionally NOT listed here; they live in
+    # DiagnosticTokenMerger (token_merge_diagnostics.py), which extends these
+    # tuples so the main training/inference path can never select them.
+    VECTORIZED_STRATEGIES = (
+        "local_2x2_same_time_vec",
+        "local_2x2_importance_protected_vec",
+        "local_2x2_hybrid_score_vec",
+    )
+    # Vectorized strategies that must NOT silently fall back to the slow Python
+    # similarity path (doing so would drop importance/protection semantics).
+    NO_PYTHON_FALLBACK_STRATEGIES = (
+        "local_2x2_importance_protected_vec",
+        "local_2x2_hybrid_score_vec",
+    )
+
     def __init__(self, config):
         super().__init__()
         self.config = normalize_merge_config(config)
 
     @torch.no_grad()
-    def forward(self, x, token_ids, token_size, rep_for_orig, t_grid, h_grid, w_grid):
+    def forward(self, x, token_ids, token_size, rep_for_orig, t_grid, h_grid, w_grid, attn_key=None):
         if self.config.strategy in ("local_2x2_same_time", "local_2x2_same_time_python"):
             return self._forward_python(
                 x,
@@ -253,15 +329,22 @@ class LocalTokenMerger(nn.Module):
                 w_grid,
                 implementation="python",
             )
-        vectorized_strategies = (
-            "local_2x2_same_time_vec",
-            "local_2x2_importance_protected_vec",
-            "local_2x2_hybrid_score_vec",
-            "local_keep_then_merge_vec",
-            "local_2x2_similarity_gated_importance_vec",
-        )
-        if self.config.strategy not in vectorized_strategies:
+        if self.config.strategy not in self.VECTORIZED_STRATEGIES:
             raise ValueError(f"Unsupported merge strategy: {self.config.strategy}")
+
+        # Grid-agnostic global bipartite soft matching (BSM). Handled entirely
+        # separately from the dense 2x2 path; works on compressed token sets and
+        # across multiple merge layers. _forward_bsm is defined ONLY on
+        # DiagnosticTokenMerger and the strategy name is registered ONLY in that
+        # subclass's VECTORIZED_STRATEGIES, so the base LocalTokenMerger raises
+        # "Unsupported merge strategy" above and never reaches this branch.
+        if self.config.strategy in (
+            "bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec",
+        ):
+            return self._forward_bsm(
+                x, token_ids, token_size, rep_for_orig,
+                int(t_grid), int(h_grid), int(w_grid), attn_key,
+            )
 
         if self.config.merge_ratio <= 0.0:
             importance = None
@@ -289,12 +372,7 @@ class LocalTokenMerger(nn.Module):
             x, token_ids, rep_for_orig, int(t_grid), int(h_grid), int(w_grid)
         )
         if not can_vectorize:
-            if self.config.strategy in (
-                "local_2x2_importance_protected_vec",
-                "local_2x2_hybrid_score_vec",
-                "local_keep_then_merge_vec",
-                "local_2x2_similarity_gated_importance_vec",
-            ):
+            if self.config.strategy in self.NO_PYTHON_FALLBACK_STRATEGIES:
                 raise RuntimeError(
                     f"{self.config.strategy} cannot fall back to the Python similarity path "
                     f"because that would drop importance/protection semantics: {fallback_reason}"
@@ -412,6 +490,12 @@ class LocalTokenMerger(nn.Module):
         return x_new, ids_new, size_new, rep_new, info
 
     def _can_vectorize_dense_grid(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
+        # Grid-agnostic global BSM does not require a dense contiguous 2x2 grid;
+        # it can run on already-compressed token sets at every merge layer. (The
+        # forward() dispatch routes bsm before this is reached; this guard is a
+        # defensive no-op for that strategy.)
+        if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec"):
+            return True, None
         expected_tokens = int(t_grid * h_grid * w_grid)
         if h_grid % 2 != 0 or w_grid % 2 != 0:
             return False, "odd_spatial_grid"
@@ -474,56 +558,23 @@ class LocalTokenMerger(nn.Module):
             importance, importance_cells, flat_cell_positions
         )
 
-        if self.config.strategy == "local_2x2_hybrid_score_vec":
-            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
-                self._select_hybrid_pairs(
-                    similarities,
-                    flat_cell_positions,
-                    pair_left,
-                    pair_right,
-                    importance_cells,
-                    protected_cells,
-                    target_merges,
-                )
-            )
-        elif self.config.strategy == "local_keep_then_merge_vec":
-            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
-                self._select_keep_then_merge_pairs(
-                    similarities,
-                    flat_cell_positions,
-                    pair_left,
-                    pair_right,
-                    importance_cells,
-                    protected_cells,
-                    target_merges,
-                )
-            )
-        elif self.config.strategy == "local_2x2_similarity_gated_importance_vec":
-            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
-                self._select_similarity_gated_importance_pairs(
-                    similarities,
-                    flat_cell_positions,
-                    pair_left,
-                    pair_right,
-                    norm_cells,
-                    importance_cells,
-                    protected_cells,
-                    target_merges,
-                )
-            )
-        else:
-            source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count = (
-                self._select_similarity_pairs(
-                    similarities,
-                    flat_cell_positions,
-                    pair_left,
-                    pair_right,
-                    norm_cells,
-                    importance_cells,
-                    protected_cells,
-                    target_merges,
-                )
-            )
+        (
+            source_pos,
+            receiver_pos,
+            selected_scores,
+            num_accepted,
+            candidate_count,
+            candidate_cell_count,
+        ) = self._dispatch_pair_selection(
+            similarities,
+            flat_cell_positions,
+            pair_left,
+            pair_right,
+            norm_cells,
+            importance_cells,
+            protected_cells,
+            target_merges,
+        )
 
         if num_accepted <= 0:
             return x, token_ids, token_size, rep_for_orig, self._info(
@@ -540,33 +591,20 @@ class LocalTokenMerger(nn.Module):
                 num_accepted=0,
             )
 
-        source_ids = token_ids.gather(1, source_pos)
-        receiver_ids = token_ids.gather(1, receiver_pos)
-        source_weight = token_size.gather(1, source_pos)
-        receiver_weight = token_size.gather(1, receiver_pos)
-        total_weight = source_weight + receiver_weight
-
-        source_x = x.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))
-        receiver_x = x.gather(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim))
-        merged_x = (
-            receiver_x * receiver_weight.unsqueeze(-1)
-            + source_x * source_weight.unsqueeze(-1)
-        ) / total_weight.unsqueeze(-1)
-
-        x_updated = x.clone()
-        token_size_updated = token_size.clone()
-        x_updated.scatter_(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim), merged_x)
-        token_size_updated.scatter_(1, receiver_pos, total_weight)
-
-        keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
-        keep.scatter_(1, source_pos, False)
-        num_after = num_tokens - num_accepted
-        x_new = x_updated[keep].reshape(batch_size, num_after, dim)
-        ids_new = token_ids[keep].reshape(batch_size, num_after)
-        size_new = token_size_updated[keep].reshape(batch_size, num_after)
-
-        rep_new = rep_for_orig.clone()
-        rep_new.scatter_(1, source_ids, receiver_ids)
+        # Shared, grid-agnostic merge/compaction (gather/scatter by token
+        # position, size-weighted average, build compressed tensors, update
+        # rep_for_orig). Reused verbatim by the global BSM path. multi_layer_rep
+        # is False here so the A/B/C/B2/C2 tensors are byte-identical.
+        x_new, ids_new, size_new, rep_new = self._apply_merge_from_positions(
+            x,
+            token_ids,
+            token_size,
+            rep_for_orig,
+            source_pos,
+            receiver_pos,
+            num_accepted,
+            multi_layer_rep=False,
+        )
 
         info = self._info(
             x,
@@ -601,6 +639,81 @@ class LocalTokenMerger(nn.Module):
         )
         return x_new, ids_new, size_new, rep_new, info
 
+    def _apply_merge_from_positions(
+        self,
+        x,
+        token_ids,
+        token_size,
+        rep_for_orig,
+        source_pos,
+        receiver_pos,
+        num_accepted,
+        multi_layer_rep=False,
+    ):
+        """Shared post-pair-selection merge/compaction (grid-agnostic).
+
+        Gather source/receiver by token POSITION, size-weighted average into the
+        receiver, drop the source positions, and compact to a dense
+        ``[B, N-num_accepted, D]``. This assumes source positions are disjoint
+        from each other AND from receiver positions, and that each receiver is
+        targeted at most once (true for the 2x2 cell strategies). Extracted from
+        ``_forward_vectorized`` so the 2x2 path and global BSM share ONE
+        implementation; with ``multi_layer_rep=False`` the produced tensors are
+        byte-identical to the original A/B/C/B2/C2 behaviour.
+        """
+        batch_size, num_tokens, dim = x.shape
+
+        source_ids = token_ids.gather(1, source_pos)
+        receiver_ids = token_ids.gather(1, receiver_pos)
+        source_weight = token_size.gather(1, source_pos)
+        receiver_weight = token_size.gather(1, receiver_pos)
+        total_weight = source_weight + receiver_weight
+
+        source_x = x.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))
+        receiver_x = x.gather(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim))
+        merged_x = (
+            receiver_x * receiver_weight.unsqueeze(-1)
+            + source_x * source_weight.unsqueeze(-1)
+        ) / total_weight.unsqueeze(-1)
+
+        x_updated = x.clone()
+        token_size_updated = token_size.clone()
+        x_updated.scatter_(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim), merged_x)
+        token_size_updated.scatter_(1, receiver_pos, total_weight)
+
+        keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
+        keep.scatter_(1, source_pos, False)
+        num_after = num_tokens - num_accepted
+        x_new = x_updated[keep].reshape(batch_size, num_after, dim)
+        ids_new = token_ids[keep].reshape(batch_size, num_after)
+        size_new = token_size_updated[keep].reshape(batch_size, num_after)
+
+        if multi_layer_rep:
+            # Remap EVERY original whose CURRENT rep is one of this layer's
+            # sources (not just originals whose id == source_id, which is all the
+            # base scatter did). Within one layer source positions are disjoint
+            # and never coincide with receivers, so a single identity-LUT scatter
+            # + gather is exact; across layers it composes because each layer
+            # applies its own remap to the running rep_for_orig. This is the
+            # vectorized equivalent of the Python path's
+            # ``rep[rep == source_id] = receiver_id`` and is required for correct
+            # restore_dense under gradual multi-layer merging.
+            num_original_tokens = rep_for_orig.shape[1]
+            remap = (
+                torch.arange(num_original_tokens, device=x.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+                .clone()
+            )
+            remap.scatter_(1, source_ids, receiver_ids)
+            rep_new = remap.gather(1, rep_for_orig)
+        else:
+            # BYTE-IDENTICAL to the original A/B/C/B2/C2 behaviour.
+            rep_new = rep_for_orig.clone()
+            rep_new.scatter_(1, source_ids, receiver_ids)
+
+        return x_new, ids_new, size_new, rep_new
+
     def _compute_protected_cells(self, importance, importance_cells, flat_cell_positions):
         protected = torch.zeros_like(importance_cells, dtype=torch.bool)
         mode = str(self.config.protect_mode or "none")
@@ -629,6 +742,45 @@ class LocalTokenMerger(nn.Module):
     def _candidate_cell_count(self, valid):
         valid_cells = valid.any(dim=-1) if valid.ndim == 3 else valid
         return int(valid_cells.sum().item())
+
+    def _dispatch_pair_selection(
+        self,
+        similarities,
+        flat_cell_positions,
+        pair_left,
+        pair_right,
+        norm_cells,
+        importance_cells,
+        protected_cells,
+        target_merges,
+    ):
+        """Select (source, receiver) merge pairs for the configured strategy.
+
+        Base path handles A (``local_2x2_same_time_vec``),
+        B (``local_2x2_importance_protected_vec``) and C
+        (``local_2x2_hybrid_score_vec``). DiagnosticTokenMerger overrides this
+        to add the research-only B2/C2 strategies.
+        """
+        if self.config.strategy == "local_2x2_hybrid_score_vec":
+            return self._select_hybrid_pairs(
+                similarities,
+                flat_cell_positions,
+                pair_left,
+                pair_right,
+                importance_cells,
+                protected_cells,
+                target_merges,
+            )
+        return self._select_similarity_pairs(
+            similarities,
+            flat_cell_positions,
+            pair_left,
+            pair_right,
+            norm_cells,
+            importance_cells,
+            protected_cells,
+            target_merges,
+        )
 
     def _select_similarity_pairs(
         self,
@@ -738,146 +890,12 @@ class LocalTokenMerger(nn.Module):
         selected_cos = selected_directed_cos.gather(2, selected_dir_index.unsqueeze(-1)).squeeze(-1)
         return source_pos, receiver_pos, selected_cos, num_accepted, candidate_count, candidate_cell_count
 
-    def _local_similarity_matrix(self, similarities, pair_left, pair_right):
-        batch_size, num_cells = similarities.shape[:2]
-        sim_matrix = torch.full(
-            (batch_size, num_cells, 4, 4),
-            -torch.inf,
-            device=similarities.device,
-            dtype=similarities.dtype,
-        )
-        sim_matrix[:, :, pair_left, pair_right] = similarities
-        sim_matrix[:, :, pair_right, pair_left] = similarities
-        return sim_matrix
-
-    def _select_keep_then_merge_pairs(
-        self,
-        similarities,
-        flat_cell_positions,
-        pair_left,
-        pair_right,
-        importance_cells,
-        protected_cells,
-        target_merges,
-    ):
-        sim_matrix = self._local_similarity_matrix(similarities, pair_left, pair_right)
-        redundancy = sim_matrix.max(dim=-1).values
-        novelty = 1.0 - redundancy
-        keep_source = str(self.config.keep_source)
-        if keep_source == "redundancy":
-            keep_score = novelty
-        elif keep_source == "importance":
-            keep_score = importance_cells
-        elif keep_source == "importance_redundancy":
-            keep_score = (
-                float(self.config.keep_score_alpha) * novelty
-                + float(self.config.keep_score_beta) * importance_cells
-            )
-        elif keep_source == "random":
-            keep_score = torch.rand_like(novelty)
-        else:
-            raise ValueError(f"Unsupported keep_source: {keep_source}")
-
-        source_local = keep_score.argmin(dim=-1)
-        source_protected = protected_cells.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
-        sim_to_receiver = sim_matrix.gather(
-            2, source_local.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 4)
-        ).squeeze(2)
-        local_index = torch.arange(4, device=similarities.device, dtype=torch.long)
-        valid_receiver = local_index.view(1, 1, 4) != source_local.unsqueeze(-1)
-        sim_to_receiver = sim_to_receiver.masked_fill(~valid_receiver, -torch.inf)
-        best_receiver_sim, receiver_local = sim_to_receiver.max(dim=-1)
-
-        valid = ~source_protected & torch.isfinite(best_receiver_sim)
-        if float(self.config.similarity_threshold) >= 0.0:
-            valid = valid & (best_receiver_sim >= float(self.config.similarity_threshold))
-
-        num_accepted = self._candidate_target_merges(valid, target_merges)
-        candidate_count = int(valid.sum().item())
-        candidate_cell_count = self._candidate_cell_count(valid)
-        if num_accepted <= 0:
-            empty = torch.empty(similarities.shape[0], 0, device=similarities.device, dtype=torch.long)
-            return empty, empty, torch.empty_like(empty, dtype=similarities.dtype), 0, candidate_count, candidate_cell_count
-
-        cell_score = best_receiver_sim.masked_fill(~valid, -torch.inf)
-        selected_scores, selected_cells = cell_score.topk(num_accepted, dim=1)
-        if not bool(torch.isfinite(selected_scores).all().item()):
-            raise RuntimeError("Invalid keep-then-merge selection produced non-finite scores")
-        selected_positions = flat_cell_positions[selected_cells]
-        source_local = source_local.gather(1, selected_cells)
-        receiver_local = receiver_local.gather(1, selected_cells)
-        source_pos = selected_positions.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
-        receiver_pos = selected_positions.gather(2, receiver_local.unsqueeze(-1)).squeeze(-1)
-        return source_pos, receiver_pos, selected_scores, num_accepted, candidate_count, candidate_cell_count
-
-    def _select_similarity_gated_importance_pairs(
-        self,
-        similarities,
-        flat_cell_positions,
-        pair_left,
-        pair_right,
-        norm_cells,
-        importance_cells,
-        protected_cells,
-        target_merges,
-    ):
-        left_importance = importance_cells[:, :, pair_left]
-        right_importance = importance_cells[:, :, pair_right]
-        left_norm = norm_cells[:, :, pair_left]
-        right_norm = norm_cells[:, :, pair_right]
-        if bool(self.config.direction_by_importance):
-            left_is_receiver = torch.where(
-                left_importance == right_importance,
-                left_norm >= right_norm,
-                left_importance >= right_importance,
-            )
-        elif self.config.receiver == "max_norm":
-            left_is_receiver = left_norm >= right_norm
-        else:
-            left_is_receiver = torch.ones_like(similarities, dtype=torch.bool)
-
-        source_local_all = torch.where(left_is_receiver, pair_right, pair_left)
-        receiver_local_all = torch.where(left_is_receiver, pair_left, pair_right)
-        best_sim = similarities.max(dim=-1, keepdim=True).values
-        epsilon = max(0.0, float(self.config.similarity_gate_epsilon))
-        valid = similarities >= (best_sim - epsilon)
-        source_protected = protected_cells.gather(2, source_local_all)
-        valid = valid & ~source_protected
-        if float(self.config.similarity_threshold) >= 0.0:
-            valid = valid & (similarities >= float(self.config.similarity_threshold))
-
-        num_accepted = self._candidate_target_merges(valid, target_merges)
-        candidate_count = int(valid.sum().item())
-        candidate_cell_count = self._candidate_cell_count(valid)
-        if num_accepted <= 0:
-            empty = torch.empty(similarities.shape[0], 0, device=similarities.device, dtype=torch.long)
-            return empty, empty, torch.empty_like(empty, dtype=similarities.dtype), 0, candidate_count, candidate_cell_count
-
-        importance_gap = (left_importance - right_importance).abs()
-        tie_weight = float(self.config.score_beta) * max(epsilon, 1e-6)
-        score = similarities + tie_weight * importance_gap
-        score = score.masked_fill(~valid, -torch.inf)
-        best_score, best_pair_index = score.max(dim=-1)
-        selected_scores_for_cells, selected_cells = best_score.topk(num_accepted, dim=1)
-        if not bool(torch.isfinite(selected_scores_for_cells).all().item()):
-            raise RuntimeError("Invalid similarity-gated selection produced non-finite scores")
-        selected_pair_index = best_pair_index.gather(1, selected_cells)
-        source_local = source_local_all.gather(
-            1, selected_cells.unsqueeze(-1).expand(-1, -1, 6)
-        )
-        receiver_local = receiver_local_all.gather(
-            1, selected_cells.unsqueeze(-1).expand(-1, -1, 6)
-        )
-        source_local = source_local.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
-        receiver_local = receiver_local.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
-        selected_positions = flat_cell_positions[selected_cells]
-        source_pos = selected_positions.gather(2, source_local.unsqueeze(-1)).squeeze(-1)
-        receiver_pos = selected_positions.gather(2, receiver_local.unsqueeze(-1)).squeeze(-1)
-        selected_similarities = similarities.gather(
-            1, selected_cells.unsqueeze(-1).expand(-1, -1, similarities.shape[-1])
-        )
-        selected_cos = selected_similarities.gather(2, selected_pair_index.unsqueeze(-1)).squeeze(-1)
-        return source_pos, receiver_pos, selected_cos, num_accepted, candidate_count, candidate_cell_count
+    # NOTE: The diagnostic-only B2/C2 pair-selection helpers
+    # (``_local_similarity_matrix``, ``_select_keep_then_merge_pairs``,
+    # ``_select_similarity_gated_importance_pairs``) were moved to
+    # DiagnosticTokenMerger in token_merge_diagnostics.py. They are research-only
+    # (No-Go: never beat similarity-only baseline A) and are intentionally kept
+    # out of this main-path class.
 
     def _build_decision_dump(
         self,
@@ -1029,6 +1047,19 @@ class LocalTokenMerger(nn.Module):
 
         return x[keep], token_ids_new[keep], token_size[keep], rep
 
+    def _method_name(self):
+        """Human-readable method label for the configured strategy.
+
+        Base path covers A/B/C; DiagnosticTokenMerger overrides to add B2/C2.
+        """
+        if self.config.strategy == "local_2x2_importance_protected_vec":
+            return "B_importance_protected"
+        if self.config.strategy == "local_2x2_hybrid_score_vec":
+            return "C_hybrid_similarity_importance"
+        if self.config.merge_ratio <= 0 and self.config.importance_source != "none":
+            return "importance_diagnostic"
+        return "A_similarity_only"
+
     def _info(
         self,
         x_before,
@@ -1050,17 +1081,7 @@ class LocalTokenMerger(nn.Module):
         before = int(x_before.shape[1])
         after = int(x_after.shape[1])
         ratio = float(after / max(1, before))
-        method = "A_similarity_only"
-        if self.config.strategy == "local_2x2_importance_protected_vec":
-            method = "B_importance_protected"
-        elif self.config.strategy == "local_2x2_hybrid_score_vec":
-            method = "C_hybrid_similarity_importance"
-        elif self.config.strategy == "local_keep_then_merge_vec":
-            method = "B2_keep_then_merge"
-        elif self.config.strategy == "local_2x2_similarity_gated_importance_vec":
-            method = "C2_similarity_gated_importance"
-        elif self.config.merge_ratio <= 0 and self.config.importance_source != "none":
-            method = "importance_diagnostic"
+        method = self._method_name()
         info = {
             "method": method,
             "strategy": self.config.strategy,

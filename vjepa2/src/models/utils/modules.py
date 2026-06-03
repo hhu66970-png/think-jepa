@@ -409,6 +409,20 @@ class RoPEAttention(nn.Module):
             q = torch.cat([qd, qh, qw], dim=-1)
             k = torch.cat([kd, kh, kw], dim=-1)
 
+        # -- Optional K stash for training-free K-cosine token merging (BSM).
+        #    Captures the post-RoPE key EXACTLY as attention uses it, BEFORE the
+        #    SDPA call. Does NOT touch the SDPA kernel and never materializes the
+        #    attention-probability matrix. Off unless explicitly enabled; A/B/C
+        #    and every non-BSM path leave this flag False and pay nothing. The
+        #    flag/stash are plain instance attrs (not buffers/params) so they are
+        #    invisible to state_dict, _init_weights and _rescale_blocks.
+        if getattr(self, "_stash_attn_key", False):
+            # mean over heads -> [B, N, head_dim], detached. Mean-over-heads is
+            # the standard ToMe recipe and keeps the metric one vector per token.
+            self._stashed_key = k.detach().mean(dim=1)
+        else:
+            self._stashed_key = None
+
         if attn_mask is not None or self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(
