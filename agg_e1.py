@@ -4,8 +4,8 @@ plateau 末10 val_avg_dist。决策门:WAM−K-BSM 配对Δ<0 且单边 t< −2.
 import json, os, math
 E1 = "outputs/frontier_retrain_E1"
 DENSE = "outputs/downstream_ext30_aligned_20260602"   # 复用 dense 基线
-SEEDS = [42, 43, 44, 45, 46, 47]; LASTK = 10
-TCRIT = {5: 2.015, 4: 2.132, 3: 2.353, 2: 2.920}
+SEEDS = list(range(42, 54)); LASTK = 10   # 42-53;扩点(r25/L9_r25)n=12,其余点自动 n=6(缺seed→None过滤)
+TCRIT = {11: 1.796, 10: 1.812, 9: 1.833, 8: 1.860, 7: 1.895, 6: 1.943, 5: 2.015, 4: 2.132, 3: 2.353, 2: 2.920}
 
 
 def plat(base, cfg, s):
