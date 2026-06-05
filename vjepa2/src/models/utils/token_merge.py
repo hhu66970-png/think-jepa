@@ -64,6 +64,12 @@ class MergeConfig:
     relevance_source: str = "none"
     relevance_lambda: float = 1.0
     relevance_power: float = 1.0
+    # NEW(V2): path to a precomputed per-token relevance PRIOR (.npz with key
+    # "rel" of shape [t,h,w] / [t*h*w] / [h*w]). Used ONLY when relevance_source
+    # in {"predictor_saliency","handjoint"}; loaded once at the first merge layer
+    # and broadcast to [B, t*h*w] (clip-agnostic prior). Empty => fall back to the
+    # in-place "motion" signal (V1). The gate/topk/merge logic is UNCHANGED.
+    relevance_path: str = ""
 
 
 def normalize_merge_config(config):
@@ -160,6 +166,7 @@ def normalize_merge_config(config):
         relevance_source=str(config.get("relevance_source", "none")),
         relevance_lambda=float(config.get("relevance_lambda", 1.0)),
         relevance_power=float(config.get("relevance_power", 1.0)),
+        relevance_path=str(config.get("relevance_path", "")),
     )
     _validate_merge_config(normalized)
     return normalized

@@ -452,6 +452,49 @@ class DiagnosticTokenMerger(LocalTokenMerger):
     # NEW HELPER 3 — WAM per-token task relevance (motion saliency).
     # ---------------------------------------------------------------------
     @torch.no_grad()
+    @torch.no_grad()
+    def _load_prior_relevance(self, source, batch_size, num_tokens, t_grid, h_grid, w_grid, device):
+        """NEW(V2): load a precomputed per-token relevance PRIOR from config.relevance_path.
+
+        Returns [batch_size, num_tokens] float on `device`, or None to signal
+        "no prior -> fall back to the in-place motion signal (V1)". The prior is a
+        CLIP-AGNOSTIC normalized importance map (e.g. offline predictor saliency or
+        hand-joint density), shape [t*h*w] or [h*w] (tiled over time). Only consulted
+        at the first merge layer. Robust: any missing/unreadable/mismatched file
+        returns None (=> motion fallback), so this can NEVER crash a run.
+        """
+        if source not in ("predictor_saliency", "handjoint"):
+            return None
+        path = str(getattr(self.config, "relevance_path", "") or "")
+        if not path:
+            return None
+        import os as _os
+        import numpy as _np
+        cache = getattr(self, "_wam_prior_cache", None)
+        if cache is None or cache.get("path") != path:
+            if not _os.path.exists(path):
+                return None
+            try:
+                arr = _np.load(path)
+                rel = arr["rel"] if (hasattr(arr, "files") and "rel" in arr.files) else arr
+                rel = _np.asarray(rel, dtype="float32").reshape(-1)
+            except Exception:
+                return None
+            cache = {"path": path, "rel": rel}
+            self._wam_prior_cache = cache
+        rel = cache["rel"]
+        n_thw, n_hw = int(t_grid * h_grid * w_grid), int(h_grid * w_grid)
+        if rel.shape[0] == n_thw:
+            vec = rel
+        elif rel.shape[0] == n_hw:                      # spatial prior -> tile over time
+            vec = _np.tile(rel, int(t_grid))
+        else:
+            return None                                 # shape mismatch -> motion fallback
+        if int(vec.shape[0]) != int(num_tokens):
+            return None
+        t = torch.from_numpy(_np.ascontiguousarray(vec)).to(device=device, dtype=torch.float32)
+        return t.unsqueeze(0).expand(int(batch_size), -1).contiguous()   # [B, t*h*w]
+
     def _wam_relevance(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
         """Per-CURRENT-token task relevance in [0,1] (1 = protect hardest).
 
@@ -479,9 +522,17 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         # First merge layer: dense grid -> compute & cache (token_ids == arange,
         # so the per-current-token vector IS indexed by original id).
         if num_tokens == num_original and num_tokens == int(t_grid * h_grid * w_grid):
-            rel = compute_importance(x, int(t_grid), int(h_grid), int(w_grid),
-                                     "motion" if source not in ("norm", "norm_motion",
-                                                                "qk_global_hidden") else source)
+            # NEW(V2): if a precomputed per-token prior is configured for this source
+            # (predictor_saliency / handjoint + relevance_path), use it; otherwise
+            # fall back to the in-place adjacent-frame motion signal (V1). Everything
+            # downstream (cache, _unit01, gate, top-r, merge) is IDENTICAL either way,
+            # so this is a pure signal-source swap (clean V1-vs-V2 ablation).
+            rel = self._load_prior_relevance(source, batch_size, num_tokens,
+                                             int(t_grid), int(h_grid), int(w_grid), x.device)
+            if rel is None:
+                rel = compute_importance(x, int(t_grid), int(h_grid), int(w_grid),
+                                         "motion" if source not in ("norm", "norm_motion",
+                                                                    "qk_global_hidden") else source)
             if rel is None:
                 rel = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
             self._wam_rel_orig = rel.detach().float()              # [B, num_original]
