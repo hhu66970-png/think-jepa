@@ -41,7 +41,7 @@ def main():
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--out", default="outputs/wam_frontier/enc_speed.tsv")
     args = ap.parse_args()
-    GR5 = [12, 14, 16, 18, 20]; L9 = list(range(12, 21))
+    GR5 = [12, 14, 16, 18, 20]; L9 = list(range(12, 21)); L12 = list(range(10, 22))
     cfgs = [
         ("dense",        dict(enabled=False, strategy="bsm_ksim_gradual_vec", layers=[12], ratio=0.0)),
         ("A_r25",        dict(enabled=True,  strategy="local_2x2_same_time_vec", layers=[8], ratio=0.25)),
@@ -51,6 +51,15 @@ def main():
         ("kbsm_L9_r25",  dict(enabled=True,  strategy="bsm_ksim_gradual_vec", layers=L9, ratio=0.25)),
         ("pitome_L9_r25",dict(enabled=True,  strategy="bsm_pitome_gradual_vec", layers=L9, ratio=0.25)),
         ("wam_L9_r25",   dict(enabled=True,  strategy="bsm_taware_gradual_vec", layers=L9, ratio=0.25, relevance=("motion", 1.0))),
+        ("kbsm_r20",     dict(enabled=True,  strategy="bsm_ksim_gradual_vec", layers=GR5, ratio=0.20)),
+        ("pitome_r20",   dict(enabled=True,  strategy="bsm_pitome_gradual_vec", layers=GR5, ratio=0.20)),
+        ("wam_r20",      dict(enabled=True,  strategy="bsm_taware_gradual_vec", layers=GR5, ratio=0.20, relevance=("motion", 1.0))),
+        ("kbsm_r25",     dict(enabled=True,  strategy="bsm_ksim_gradual_vec", layers=GR5, ratio=0.25)),
+        ("pitome_r25",   dict(enabled=True,  strategy="bsm_pitome_gradual_vec", layers=GR5, ratio=0.25)),
+        ("wam_r25",      dict(enabled=True,  strategy="bsm_taware_gradual_vec", layers=GR5, ratio=0.25, relevance=("motion", 1.0))),
+        ("kbsm_L12_r25", dict(enabled=True,  strategy="bsm_ksim_gradual_vec", layers=L12, ratio=0.25)),
+        ("pitome_L12_r25",dict(enabled=True, strategy="bsm_pitome_gradual_vec", layers=L12, ratio=0.25)),
+        ("wam_L12_r25",  dict(enabled=True,  strategy="bsm_taware_gradual_vec", layers=L12, ratio=0.25, relevance=("motion", 1.0))),
     ]
     model = E.build_model(args.checkpoint, args.num_frames, args.img_size,
                           args.patch_size, "bsm_ksim_gradual_vec", "cuda")
