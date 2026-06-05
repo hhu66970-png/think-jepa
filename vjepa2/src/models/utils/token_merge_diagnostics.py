@@ -452,7 +452,6 @@ class DiagnosticTokenMerger(LocalTokenMerger):
     # NEW HELPER 3 — WAM per-token task relevance (motion saliency).
     # ---------------------------------------------------------------------
     @torch.no_grad()
-    @torch.no_grad()
     def _load_prior_relevance(self, source, batch_size, num_tokens, t_grid, h_grid, w_grid, device):
         """NEW(V2): load a precomputed per-token relevance PRIOR from config.relevance_path.
 
@@ -492,9 +491,13 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             return None                                 # shape mismatch -> motion fallback
         if int(vec.shape[0]) != int(num_tokens):
             return None
-        t = torch.from_numpy(_np.ascontiguousarray(vec)).to(device=device, dtype=torch.float32)
-        return t.unsqueeze(0).expand(int(batch_size), -1).contiguous()   # [B, t*h*w]
+        try:                                            # (B) device-level guard: never raise
+            t = torch.from_numpy(_np.ascontiguousarray(vec)).to(device=device, dtype=torch.float32)
+            return t.unsqueeze(0).expand(int(batch_size), -1).contiguous()   # [B, t*h*w]
+        except Exception:
+            return None
 
+    @torch.no_grad()
     def _wam_relevance(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
         """Per-CURRENT-token task relevance in [0,1] (1 = protect hardest).
 
@@ -529,7 +532,17 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             # so this is a pure signal-source swap (clean V1-vs-V2 ablation).
             rel = self._load_prior_relevance(source, batch_size, num_tokens,
                                              int(t_grid), int(h_grid), int(w_grid), x.device)
+            self._wam_rel_actual_source = "prior" if rel is not None else "motion"
             if rel is None:
+                # (C) a prior was REQUESTED but did not load -> warn ONCE so we never
+                # silently run V1 while believing it is V2 (would corrupt the ablation).
+                if (source in ("predictor_saliency", "handjoint")
+                        and str(getattr(self.config, "relevance_path", "") or "")
+                        and not getattr(self, "_wam_prior_warned", False)):
+                    self._wam_prior_warned = True
+                    print(f"[WAM][V2] WARNING: relevance_source={source!r} + relevance_path set, "
+                          f"but prior did NOT load -> falling back to MOTION (V1). "
+                          f"Check the .npz path/shape!", flush=True)
                 rel = compute_importance(x, int(t_grid), int(h_grid), int(w_grid),
                                          "motion" if source not in ("norm", "norm_motion",
                                                                     "qk_global_hidden") else source)
