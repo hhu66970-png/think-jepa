@@ -609,6 +609,9 @@ def build_dense_jepa_merge_config(args):
         "score_delta": float(getattr(args, "dense_jepa_score_delta", 0.0)),
         "lambda_norm": float(getattr(args, "dense_jepa_lambda_norm", 0.3)),
         "lambda_motion": float(getattr(args, "dense_jepa_lambda_motion", 0.7)),
+        "relevance_source": str(getattr(args, "dense_jepa_relevance_source", "none")),
+        "relevance_lambda": float(getattr(args, "dense_jepa_relevance_lambda", 1.0)),
+        "relevance_path": str(getattr(args, "dense_jepa_relevance_path", "")),
         # B2/C2 diagnostic-only fields (keep_source / receiver_search /
         # keep_score_alpha / keep_score_beta / similarity_gate_epsilon /
         # direction_by_importance) are intentionally NOT threaded through the
@@ -3890,6 +3893,18 @@ if __name__ == "__main__":
         type=str,
         default="none",
         help="importance score source: none, norm, motion, norm_motion, or qk_global_hidden",
+    )
+    parser.add_argument(
+        "--dense_jepa_relevance_source", type=str, default="none",
+        help="WAM relevance signal: none/motion (V1, in-place) OR predictor_saliency/handjoint (V2, +--dense_jepa_relevance_path)",
+    )
+    parser.add_argument(
+        "--dense_jepa_relevance_lambda", type=float, default=1.0,
+        help="WAM gate strength lambda in [0,1] (0=off==K-BSM)",
+    )
+    parser.add_argument(
+        "--dense_jepa_relevance_path", type=str, default="",
+        help="path to a precomputed per-token relevance prior .npz (V2)",
     )
     parser.add_argument(
         "--dense_jepa_protect_mode",
