@@ -16,7 +16,6 @@ knobs (temporal partition, RLT pre-merge, norm protection), were removed
 """
 
 import math
-import os as _os_   # WAM_SUPPLEMENT_PATCH_20260729
 
 import torch
 import torch.nn.functional as F
@@ -463,29 +462,11 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         at the first merge layer. Robust: any missing/unreadable/mismatched file
         returns None (=> motion fallback), so this can NEVER crash a run.
         """
-        # --- WAM_SUPPLEMENT_PATCH_20260729 -------------------------------------------
-        # Score-family sources all route through the prior loader so the merge
-        # maths below stays identical across arms (clean single-variable ablation).
-        if source not in ("predictor_saliency", "handjoint", "flow", "egocomp",
-                          "objmotion", "random", "antiflow", "prior"):
+        if source not in ("predictor_saliency", "handjoint"):
             return None
         path = str(getattr(self.config, "relevance_path", "") or "")
         if not path:
             return None
-        # PER-CLIP store: `relevance_path` is a directory holding index.json.
-        # Returns None on ANY problem, which falls back to the motion signal.
-        if _os_.path.isdir(path):
-            try:
-                from src.models.utils import wam_prior_store as _wps
-                store = _wps.get_store(path)
-                if store is None:
-                    return None
-                arr = store.lookup(_wps.get_current_clip_keys(), int(num_tokens))
-                if arr is None or arr.shape[0] != int(batch_size):
-                    return None
-                return torch.from_numpy(arr).to(device=device, dtype=torch.float32)
-            except Exception:
-                return None
         import os as _os
         import numpy as _np
         cache = getattr(self, "_wam_prior_cache", None)
@@ -555,8 +536,7 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             if rel is None:
                 # (C) a prior was REQUESTED but did not load -> warn ONCE so we never
                 # silently run V1 while believing it is V2 (would corrupt the ablation).
-                if (source in ("predictor_saliency", "handjoint", "flow", "egocomp",
-                               "objmotion", "random", "antiflow", "prior")
+                if (source in ("predictor_saliency", "handjoint")
                         and str(getattr(self.config, "relevance_path", "") or "")
                         and not getattr(self, "_wam_prior_warned", False)):
                     self._wam_prior_warned = True

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Check that WAM's multiplicative gate never encounters selected negative cosine edges."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--layers", default="12,13,14,15,16,17,18,19,20")
+    parser.add_argument("--ratio", type=float, default=0.25)
+    args = parser.parse_args()
+
+    # The experiment helper imports the encoder as ``src.models``.
+    sys.path.insert(0, str(args.repo / "vjepa2"))
+    sys.path.insert(0, str(args.repo / "tools"))
+    import run_token_merge_pca_experiment as experiment
+
+    paths = [Path(line) for line in args.manifest.read_text().splitlines() if line.strip()]
+    layers = [int(value) for value in args.layers.split(",")]
+    model = experiment.build_model(
+        str(args.repo / "vjepa2" / "vitl.pt"),
+        64,
+        256,
+        16,
+        "bsm_taware_gradual_vec",
+        "cuda",
+    )
+    model.out_layers = [23]
+    experiment.apply_merge_config(
+        model,
+        enabled=True,
+        strategy="bsm_taware_gradual_vec",
+        merge_layers=layers,
+        merge_ratio=args.ratio,
+        restore_dense=True,
+        bsm_match_metric="key",
+        merge_axis="free",
+    )
+    model.merge_config.relevance_source = "motion"
+    model.merge_config.relevance_lambda = 1.0
+
+    records = []
+    global_min = float("inf")
+    negative_layers = 0
+    with torch.no_grad():
+        for index, path in enumerate(paths, start=1):
+            video, _ = experiment.load_video(str(path), 64, 256, "cuda")
+            _, infos = model(video, return_merge_info=True, restore_dense=True)
+            merge_infos = [
+                info
+                for info in infos
+                if info.get("mean_selected_similarity") is not None
+                and info.get("num_merged_min_batch", 0) > 0
+            ]
+            minima = [float(info["min_selected_similarity"]) for info in merge_infos]
+            means = [float(info["mean_selected_similarity"]) for info in merge_infos]
+            fallback = sorted(
+                {str(info["fallback_reason"]) for info in merge_infos if info.get("fallback_reason")}
+            )
+            clip_min = min(minima) if minima else float("nan")
+            global_min = min(global_min, clip_min)
+            negative_layers += sum(value < 0 for value in minima)
+            record = {
+                "path": str(path),
+                "layer_min_selected_cosine": minima,
+                "layer_mean_selected_cosine": means,
+                "clip_min_selected_cosine": clip_min,
+                "fallback_reasons": fallback,
+                "final_tokens": merge_infos[-1].get("num_tokens_after") if merge_infos else None,
+            }
+            records.append(record)
+            print(f"[{index:03d}/{len(paths):03d}] min={clip_min:.6f} fallback={fallback or 'none'}")
+
+    report = {
+        "manifest": str(args.manifest),
+        "num_clips": len(records),
+        "layers": layers,
+        "ratio": args.ratio,
+        "global_min_selected_cosine": global_min,
+        "negative_layer_count": negative_layers,
+        "all_selected_edges_nonnegative": negative_layers == 0,
+        "records": records,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps({key: report[key] for key in report if key != "records"}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

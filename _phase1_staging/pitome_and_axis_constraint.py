@@ -1,64 +1,200 @@
-"""Diagnostic / research-only token merger: home of the Gradual K-BSM strategy.
+"""STAGING — PiToMe energy-score selection + axis-constraint (merge_axis) for K-BSM.
 
-``DiagnosticTokenMerger`` subclasses ``LocalTokenMerger`` and adds exactly one
-extra strategy: ``bsm_ksim_gradual_vec`` (global Bipartite Soft Matching on
-post-RoPE attention-Key cosine, gradual multi-layer, size-weighted; the verified
-encoder-speedup winner). A/B/C behaviour is inherited unchanged from the base.
+This file is NOT a drop-in module. It contains the *exact* methods and config
+fields to splice into the live source. Nothing here imports/extends the real
+``LocalTokenMerger`` so that ``python3 -m py_compile`` passes even on a box with
+no ``torch``. We guard the torch imports in a try/except (see below) purely so
+the syntax self-check runs; on the GPU box torch is always importable and the
+guard is a no-op.
 
-Kept out of the main path: the encoder (``vision_transformer.py``) /
-``scripts/train.sh`` never instantiate this subclass unless
-``bsm_ksim_gradual_vec`` is explicitly requested.
+What it implements (both are NEW, additive extensions of the diagnostic-only
+``bsm_ksim_gradual_vec`` path; the existing K-BSM behaviour is byte-unchanged):
 
-History: the No-Go strategies B2 (``local_keep_then_merge_vec``) and
-C2 (``local_2x2_similarity_gated_importance_vec``), plus the dead-end research
-knobs (temporal partition, RLT pre-merge, norm protection), were removed
-2026-05-31 after experiments confirmed they offered no Pareto improvement.
+  (1) PiToMe energy-score partition  -> new strategy ``bsm_pitome_gradual_vec``
+      (PiToMe, NeurIPS'24, arXiv:2405.16148). Instead of ToMe's arbitrary
+      even/odd A/B split, an energy score decides who is a *source* (high
+      energy = redundant = merged away) vs a *receiver/protected* (low energy =
+      isolated = kept). Same size-weighting, same multi-layer rep_for_orig
+      carry-forward, same rectangular [B, N-r, D] invariant as K-BSM.
+
+  (2) Axis constraint  -> new config field ``merge_axis in {free, spatial, temporal}``
+      Masks the [B, Na, Nb] cosine score matrix BEFORE the per-A argmax so BSM
+      merges only within a frame (spatial), only across frames (temporal), or
+      freely (default). Works for BOTH ``bsm_ksim_gradual_vec`` and
+      ``bsm_pitome_gradual_vec``.
+
+id<->(t,h,w) mapping — VERIFIED against token_merge.py:
+  * init_token_merge_state (L222-227): token_ids = arange(num_tokens) at L_start,
+    so the original id == flat grid position t*(H*W)+h*W+w.
+  * ids_to_coords (L230-236): tokens_per_frame = h_grid*w_grid; t = id // tpf.
+  => frame(id) = id // (h_grid * w_grid).  CONFIRMED.
+  IMPORTANT: we derive the frame from ``token_ids`` (the ORIGINAL id), NOT from
+  the current position, because by layers > L_start the position has been
+  compacted but the id still encodes the original (t,h,w). A *merged* token keeps
+  the receiver's id, hence the receiver's original frame — a sound, well-defined
+  choice for the axis mask (see INTEGRATION doc, "frame of a merged token").
+
+See INTEGRATION_pitome_axis.md for the precise file/method/line splice list.
 """
 
 import math
-import os as _os_   # WAM_SUPPLEMENT_PATCH_20260729
 
-import torch
-import torch.nn.functional as F
+# torch is mandatory on the GPU box; the guard exists ONLY so this staging file
+# compiles for `python3 -m py_compile` on a torch-less laptop. All functions
+# below reference torch/F at call time, so a missing torch never affects syntax.
+try:  # pragma: no cover - environment shim for py_compile
+    import torch
+    import torch.nn.functional as F
+except Exception:  # pragma: no cover
+    torch = None
+    F = None
 
-from src.models.utils.token_merge import LocalTokenMerger, compute_importance
+
+# ==========================================================================
+# PART A — config (token_merge.py) ::: NEW DATACLASS FIELDS + normalize/validate
+# ==========================================================================
+# ---- A.1  Add to `@dataclass MergeConfig` (token_merge.py, after the existing
+#           `bsm_match_metric: str = "key"` line ~L41). These four fields are
+#           ALSO already referenced by run_token_merge_pca_experiment.py
+#           (bsm_partition / pre_merge_ratio / bsm_protect_ratio) but are MISSING
+#           from the dataclass + normalizer today, so the harness values are
+#           currently dropped. Adding them here fixes that latent bug too.
+#
+#     # --- Axis constraint for the BSM family (bsm_ksim_gradual_vec and
+#     # bsm_pitome_gradual_vec). "free" = no constraint (default, unchanged
+#     # behaviour); "spatial" = only merge tokens in the SAME frame; "temporal"
+#     # = only merge tokens in DIFFERENT frames. Frame is derived from the
+#     # ORIGINAL token id (id // (h_grid*w_grid)). Ignored by every non-BSM
+#     # strategy, so A/B/C/B2/C2 are unaffected.
+#     merge_axis: str = "free"
+#
+#     # --- PiToMe energy score (bsm_pitome_gradual_vec only). Margin m in the
+#     # energy formula energy_i = mean_j relu(cos(i,j) - m). Larger m => only
+#     # strongly-similar neighbours count as redundancy. 0.0 reproduces a plain
+#     # mean-cosine energy. Ignored by all other strategies.
+#     pitome_margin: float = 0.0
+#
+#     # --- PiToMe energy computation budget. If the current token count N exceeds
+#     # this, energy is computed on a uniformly-subsampled set of anchor columns
+#     # of this size (O(N * anchors) instead of O(N^2)); <=0 disables subsampling
+#     # (always full O(N^2)). See _bsm_energy_scores for the complexity note.
+#     pitome_energy_max_anchors: int = 2048
+#
+#     # --- (pre-existing harness fields, currently missing from the dataclass)
+#     # bsm_partition: A/B split rule for the BSM family. "positional" = ToMe
+#     # even/odd over the current order (default, unchanged). "energy" is set
+#     # AUTOMATICALLY for bsm_pitome_gradual_vec and need not be passed. ("temporal"
+#     # is accepted for forward-compat with the harness's even/odd-by-tubelet idea
+#     # but is treated as "positional" here; prefer merge_axis=temporal instead.)
+#     bsm_partition: str = "positional"
+#     # RLT-style single pre-encoder merge ratio (unused by these two features;
+#     # carried so the harness's value is no longer silently dropped).
+#     pre_merge_ratio: float = 0.0
+#     # Protect this fraction of most-salient A-tokens (feature-norm) from BSM
+#     # merging. 0.0 = no protection (default). Used by _forward_bsm protection
+#     # block (optional; orthogonal to PiToMe energy protection).
+#     bsm_protect_ratio: float = 0.0
+#
+# ---- A.2  Add to `normalize_merge_config(...)`'s `MergeConfig(...)` kwargs
+#           (token_merge.py ~L98-127), reading from the incoming dict:
+#
+#     merge_axis=str(config.get("merge_axis", "free")),
+#     pitome_margin=float(config.get("pitome_margin", 0.0)),
+#     pitome_energy_max_anchors=int(config.get("pitome_energy_max_anchors", 2048)),
+#     bsm_partition=str(config.get("bsm_partition", "positional")),
+#     pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
+#     bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
+#
+# ---- A.3  Add to `normalize_merge_config`'s `grid_agnostic_multilayer_strategies`
+#           tuple (~L69-71) so the new strategy may also span multiple layers:
+#
+#     grid_agnostic_multilayer_strategies = (
+#         "bsm_ksim_gradual_vec",
+#         "bsm_pitome_gradual_vec",   # NEW: same multi-layer allowance as K-BSM
+#     )
+#
+# ---- A.4  Add to `_validate_merge_config(config)` (token_merge.py ~L132):
+#
+#     if config.merge_axis not in ("free", "spatial", "temporal"):
+#         raise ValueError(
+#             f"merge_axis must be one of free|spatial|temporal, got {config.merge_axis!r}"
+#         )
+#     if config.strategy == "bsm_pitome_gradual_vec" and config.pitome_margin < 0.0:
+#         raise ValueError("pitome_margin must be >= 0.0")
+# ==========================================================================
 
 
-class DiagnosticTokenMerger(LocalTokenMerger):
-    """``LocalTokenMerger`` extended with the Gradual K-BSM strategy.
+# ==========================================================================
+# PART B — DiagnosticTokenMerger (token_merge_diagnostics.py) ::: registration
+# ==========================================================================
+# ---- B.1  Extend the two class-level tuples (token_merge_diagnostics.py
+#           ~L36-45) to register the new strategy:
+#
+#     VECTORIZED_STRATEGIES = LocalTokenMerger.VECTORIZED_STRATEGIES + (
+#         "local_keep_then_merge_vec",
+#         "local_2x2_similarity_gated_importance_vec",
+#         "bsm_ksim_gradual_vec",
+#         "bsm_pitome_gradual_vec",   # NEW: PiToMe energy-score partition
+#     )
+#     NO_PYTHON_FALLBACK_STRATEGIES = LocalTokenMerger.NO_PYTHON_FALLBACK_STRATEGIES + (
+#         "local_keep_then_merge_vec",
+#         "local_2x2_similarity_gated_importance_vec",
+#         "bsm_ksim_gradual_vec",
+#         "bsm_pitome_gradual_vec",   # NEW: never hit the 2x2 Python fallback
+#     )
+#
+# ---- B.2  Add a branch to `_method_name(self)` (token_merge_diagnostics.py
+#           ~L47-54), BEFORE `return super()._method_name()`:
+#
+#     if self.config.strategy == "bsm_pitome_gradual_vec":
+#         return "BSM_pitome_energy"
+#
+# ---- B.3  forward() dispatch.  bsm_pitome_gradual_vec must reach `_forward_bsm`
+#           exactly like bsm_ksim_gradual_vec. The cleanest splice keeps a single
+#           dispatch site and lets `_forward_bsm` branch on the strategy name
+#           internally (the partition mode is read from self.config inside
+#           _forward_bsm, see PART C). In token_merge.py forward() (~L299-303),
+#           widen the existing condition:
+#
+#         if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec"):
+#             return self._forward_bsm(
+#                 x, token_ids, token_size, rep_for_orig,
+#                 int(t_grid), int(h_grid), int(w_grid), attn_key,
+#             )
+#
+#           AND in token_merge.py `_can_vectorize_dense_grid` (~L453) widen the
+#           defensive early-return likewise:
+#
+#         if self.config.strategy in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec"):
+#             return True, None
+# ==========================================================================
 
-    A/B/C behaviour is inherited unchanged from the base class; this subclass
-    adds only ``bsm_ksim_gradual_vec`` (the verified encoder-speedup winner).
+
+# ==========================================================================
+# PART C — REPLACE DiagnosticTokenMerger._forward_bsm  (token_merge_diagnostics.py
+#          L251-389) with the version below, plus the two NEW helper methods that
+#          follow it (_bsm_energy_partition, _bsm_axis_mask).
+#
+# Diff summary vs the current _forward_bsm:
+#   * unchanged: metric selection (key vs feature fallback), size-weighted
+#     scatter-add merge, multi-layer rep_for_orig remap, rectangular invariant,
+#     the r-cap logic, and the K-BSM (positional) code path.
+#   * NEW: a partition step. For bsm_pitome_gradual_vec we build A (sources pool)
+#     / B (dst pool) from the ENERGY score instead of even/odd. For
+#     bsm_ksim_gradual_vec the even/odd split is preserved EXACTLY.
+#   * NEW: after `scores = bmm(a, b^T)` and BEFORE `scores.max(dim=2)` we apply
+#     the merge_axis mask, and exclude any A-row that becomes all -inf from top-r.
+# ==========================================================================
+class _PiToMeAxisForwardBSM:
+    """Container for the spliced `_forward_bsm` + helpers.
+
+    These three methods are written to live on ``DiagnosticTokenMerger``; the
+    class wrapper here exists only so this staging file is importable/compilable
+    in isolation. Copy the method bodies (the `self`-methods) into
+    DiagnosticTokenMerger; do NOT copy this wrapper class.
     """
 
-    VECTORIZED_STRATEGIES = LocalTokenMerger.VECTORIZED_STRATEGIES + (
-        "bsm_ksim_gradual_vec",  # Gradual K-BSM (grid-agnostic, multi-layer)
-        "bsm_pitome_gradual_vec",  # NEW: PiToMe energy-score partition
-        "bsm_taware_gradual_vec",  # WAM: K-BSM + task-relevance (motion) gate
-    )
-    NO_PYTHON_FALLBACK_STRATEGIES = LocalTokenMerger.NO_PYTHON_FALLBACK_STRATEGIES + (
-        "bsm_ksim_gradual_vec",  # must never hit the 2x2 Python fallback path
-        "bsm_pitome_gradual_vec",  # NEW: never hit the 2x2 Python fallback
-        "bsm_taware_gradual_vec",  # WAM: never hit the 2x2 Python fallback
-    )
-
-    def _method_name(self):
-        if self.config.strategy == "bsm_ksim_gradual_vec":
-            return "BSM_ksim_gradual"
-        if self.config.strategy == "bsm_pitome_gradual_vec":
-            return "BSM_pitome_energy"
-        if self.config.strategy == "bsm_taware_gradual_vec":
-            return "BSM_taware_motion"
-        return super()._method_name()
-
-    # Gradual K-BSM: global bipartite soft matching (training-free, SDPA-safe).
-    # Grid-agnostic; runs on compressed token sets across MULTIPLE layers. NEVER
-    # routes through the dense 2x2 _forward_vectorized path (no _reshape_2x2_cells,
-    # no compute_importance, no flat_cell_positions), so compressed inputs at
-    # layers > L_start are handled natively. Reached only from
-    # LocalTokenMerger.forward's bsm dispatch (subclass-only strategy).
-    # ------------------------------------------------------------------
-    @torch.no_grad()
+    @torch.no_grad() if torch is not None else (lambda f: f)
     def _forward_bsm(self, x, token_ids, token_size, rep_for_orig, t_grid, h_grid, w_grid, attn_key):
         batch_size, num_tokens, dim = x.shape
 
@@ -95,11 +231,6 @@ class DiagnosticTokenMerger(LocalTokenMerger):
                 fallback_reason = "attn_key_unavailable"
             else:
                 fallback_reason = "attn_key_shape_mismatch"
-        # Neutralize any non-finite metric row at the source so neither the
-        # cosine score bmm nor the PiToMe energy bmm can produce nan/inf; a
-        # genuine zero row then normalizes to a finite ~0 vector (eps guard).
-        # No-op for the finite metrics K-BSM always sees -> K-BSM unchanged.
-        metric_src = torch.nan_to_num(metric_src, nan=0.0, posinf=0.0, neginf=0.0)
         metric = F.normalize(metric_src, dim=-1, eps=1e-6)  # [B, N, d]
 
         # -- Bipartite partition over the CURRENT token order ----------------
@@ -136,16 +267,9 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         # (even/odd, shared across the batch) but per-sample [B, Na]/[B, Nb] for
         # PiToMe (energy ranking differs per sample). Handle both shapes inline so
         # this method is correct as-written for either partition.
-        # Bugfix: gather along the METRIC's own feature width (post-RoPE key
-        # head_dim, e.g. 64) -- NOT x's hidden dim (1024). They are equal only on
-        # the feature_fallback path (metric == x); with the key metric they differ,
-        # so expanding to `dim` mis-sized the gather index and raised
-        # "Size does not match at dimension 2". K-BSM took the index_select branch
-        # and never hit this, which is why it surfaced only once PiToMe used key.
-        d_metric = metric.shape[-1]
         if a_idx.dim() == 2:
-            a_metric = metric.gather(1, a_idx.unsqueeze(-1).expand(-1, -1, d_metric))  # [B, Na, d]
-            b_metric = metric.gather(1, b_idx.unsqueeze(-1).expand(-1, -1, d_metric))  # [B, Nb, d]
+            a_metric = metric.gather(1, a_idx.unsqueeze(-1).expand(-1, -1, dim))  # [B, Na, d]
+            b_metric = metric.gather(1, b_idx.unsqueeze(-1).expand(-1, -1, dim))  # [B, Nb, d]
         else:
             a_metric = metric.index_select(1, a_idx)   # [B, Na, d]
             b_metric = metric.index_select(1, b_idx)   # [B, Nb, d]
@@ -187,40 +311,12 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             return x, token_ids, token_size, rep_for_orig, info
         r = r_eff
 
-        # -- WAM task-relevance gate (NEW; bsm_taware_gradual_vec only) -------
-        # Down-weight the merge PRIORITY of any edge touching a high-relevance
-        # (e.g. high-motion / task-relevant) token, so such tokens are dropped
-        # LAST. Partner CHOICE (best_b_local) is UNCHANGED — only which edges the
-        # top-r selects changes. relevance_lambda=0 / strategy!=taware => identical
-        # to K-BSM (rank_score == best_sim).
-        rank_score = best_sim
-        rel_source_used = None
-        if self.config.strategy == "bsm_taware_gradual_vec":
-            lam = float(getattr(self.config, "relevance_lambda", 1.0))
-            if lam > 0.0:
-                rel = self._wam_relevance(x, token_ids, rep_for_orig,
-                                          int(t_grid), int(h_grid), int(w_grid))  # [B,N] in [0,1]
-                rel_source_used = str(getattr(self.config, "relevance_source", "motion") or "motion")
-                pw = float(getattr(self.config, "relevance_power", 1.0))
-                gate = (1.0 - lam * rel).clamp(0.0, 1.0).pow(pw)        # [B, N]
-                if a_idx.dim() == 2:
-                    gate_a = gate.gather(1, a_idx)                      # [B, Na]
-                    gate_b_all = gate.gather(1, b_idx)                  # [B, Nb]
-                else:
-                    gate_a = gate.index_select(1, a_idx)               # [B, Na]
-                    gate_b_all = gate.index_select(1, b_idx)           # [B, Nb]
-                gate_b_chosen = gate_b_all.gather(1, best_b_local)    # [B, Na]
-                gated = best_sim * gate_a * gate_b_chosen
-                # keep axis-masked (-inf) rows at -inf (avoid -inf*0=nan promotion)
-                rank_score = torch.where(torch.isfinite(best_sim), gated, best_sim)
-
-        # keep the r strongest A->B edges per sample (top-r by rank_score). r is a
+        # keep the r strongest A->B edges per sample (top-r over A-tokens). r is a
         # single scalar across the batch -> exactly r sources dropped per sample
         # -> x_new stays a dense [B, N-r, D] (the invariant A/B/C rely on). Every
         # selected edge is finite because r <= #valid rows.
-        _, edge_a_local = rank_score.topk(r, dim=1)             # [B, r]
+        edge_sim, edge_a_local = best_sim.topk(r, dim=1)        # [B, r]
         edge_b_local = best_b_local.gather(1, edge_a_local)     # [B, r]
-        edge_sim = best_sim.gather(1, edge_a_local)             # [B, r] ACTUAL cosine
 
         # map A/B local indices back to ABSOLUTE token positions (per-sample or
         # shared, mirroring the a_idx/b_idx shape handled above).
@@ -236,37 +332,24 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         # unique (A disjoint, never overlaps B), so "drop sources, keep rest" stays
         # rectangular with exactly r removed per sample regardless of collisions.
 
-        # -- Size-weighted merge (NUMERICALLY HARDENED) ----------------------
-        # Bugfix (PiToMe NaN): the energy partition can funnel many redundant
-        # sources into a FEW low-energy receivers, so a receiver token_size can
-        # reach ~1e3 (vs ~4e2 for K-BSM even/odd). Under fp16 AMP (downstream
-        # training) the weighted sum x*size then exceeds the fp16 max (65504) and
-        # overflows to +/-inf -> inf/inf = nan, which poisons the encoder output
-        # and the downstream loss (epoch1 non-finite). We therefore accumulate the
-        # weighted average in FP32 and only cast back to x.dtype at the end. This
-        # is a NO-OP for the fp32 encoder harness (x already fp32) -> K-BSM encoder
-        # numbers are byte-identical; it only removes the fp16 overflow under AMP.
-        x_f = x.float()
-        size_f = token_size.float()
+        # -- Size-weighted merge (UNCHANGED) ---------------------------------
         source_ids = token_ids.gather(1, source_pos)            # [B, r]
         receiver_ids = token_ids.gather(1, receiver_pos)        # [B, r]
-        source_weight = size_f.gather(1, source_pos)            # [B, r] fp32
-        source_x = x_f.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))  # [B, r, D] fp32
-        weighted_src = source_x * source_weight.unsqueeze(-1)   # [B, r, D] fp32
+        source_weight = token_size.gather(1, source_pos)        # [B, r]
+        source_x = x.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))  # [B, r, D]
+        weighted_src = source_x * source_weight.unsqueeze(-1)   # [B, r, D]
 
-        acc_x = torch.zeros_like(x_f)
-        acc_w = torch.zeros_like(size_f)
+        acc_x = torch.zeros_like(x)
+        acc_w = torch.zeros_like(token_size)
         acc_x.scatter_add_(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim), weighted_src)
         acc_w.scatter_add_(1, receiver_pos, source_weight)
         recv_mask = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.bool)
         recv_mask.scatter_(1, receiver_pos, True)
-        old_w = size_f                                           # [B, N] fp32
+        old_w = token_size                                       # [B, N]
         new_w = old_w + acc_w
-        merged_x = (x_f * old_w.unsqueeze(-1) + acc_x) / new_w.clamp_min(1e-6).unsqueeze(-1)
-        # guard against any residual non-finite (e.g. a non-finite incoming x row)
-        merged_x = torch.nan_to_num(merged_x, nan=0.0, posinf=0.0, neginf=0.0)
-        x_updated = torch.where(recv_mask.unsqueeze(-1), merged_x.to(x.dtype), x)
-        token_size_updated = torch.where(recv_mask, new_w.to(token_size.dtype), token_size)
+        merged_x = (x * old_w.unsqueeze(-1) + acc_x) / new_w.clamp_min(1e-6).unsqueeze(-1)
+        x_updated = torch.where(recv_mask.unsqueeze(-1), merged_x, x)
+        token_size_updated = torch.where(recv_mask, new_w, old_w)
 
         # -- Drop sources, keep rest (rectangular, UNCHANGED) ----------------
         keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
@@ -299,9 +382,6 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         info["matching_metric"] = match_metric
         info["bsm_partition"] = partition_name
         info["merge_axis"] = axis
-        if rel_source_used is not None:
-            info["relevance_source"] = rel_source_used
-            info["relevance_lambda"] = float(getattr(self.config, "relevance_lambda", 1.0))
         if energy_a is not None:
             e = energy_a.detach().float()
             info["pitome_energy_mean"] = float(e.mean().item())
@@ -315,7 +395,7 @@ class DiagnosticTokenMerger(LocalTokenMerger):
     # ---------------------------------------------------------------------
     # NEW HELPER 1 — PiToMe energy partition.
     # ---------------------------------------------------------------------
-    @torch.no_grad()
+    @torch.no_grad() if torch is not None else (lambda f: f)
     def _bsm_energy_partition(self, metric, num_tokens):
         """Split tokens into A (high-energy sources) / B (low-energy receivers).
 
@@ -389,13 +469,6 @@ class DiagnosticTokenMerger(LocalTokenMerger):
 
         # SAME split sizes as even/odd so all downstream r-caps still hold.
         na = (n + 1) // 2
-        # Sanitize before ranking: a non-finite incoming key/feature row would make
-        # cos -> nan -> energy nan and torch.argsort with nan is UNDEFINED (garbage
-        # permutation, could even drop/duplicate positions). Map non-finite energy
-        # to a very low finite value so such tokens sort to the receiver (B) pool
-        # and the partition stays a valid permutation. Finite energies are
-        # untouched, so K-BSM is unaffected and normal PiToMe runs identically.
-        energy = torch.nan_to_num(energy, nan=-1.0e4, posinf=1.0e4, neginf=-1.0e4)
         # rank by DESCENDING energy: top-na = high energy = sources pool (A);
         # the remainder = low energy = receivers pool (B). stable sort keeps the
         # order deterministic for ties.
@@ -408,7 +481,7 @@ class DiagnosticTokenMerger(LocalTokenMerger):
     # ---------------------------------------------------------------------
     # NEW HELPER 2 — axis-constraint mask.
     # ---------------------------------------------------------------------
-    @torch.no_grad()
+    @torch.no_grad() if torch is not None else (lambda f: f)
     def _bsm_axis_mask(self, scores, token_ids, a_idx, b_idx, h_grid, w_grid, axis):
         """Mask the [B, Na, Nb] cosine matrix by frame relationship.
 
@@ -449,132 +522,46 @@ class DiagnosticTokenMerger(LocalTokenMerger):
         a_valid_row = allowed.any(dim=2)                          # [B, Na]
         return scores_masked, a_valid_row
 
-    # ---------------------------------------------------------------------
-    # NEW HELPER 3 — WAM per-token task relevance (motion saliency).
-    # ---------------------------------------------------------------------
-    @torch.no_grad()
-    def _load_prior_relevance(self, source, batch_size, num_tokens, t_grid, h_grid, w_grid, device):
-        """NEW(V2): load a precomputed per-token relevance PRIOR from config.relevance_path.
 
-        Returns [batch_size, num_tokens] float on `device`, or None to signal
-        "no prior -> fall back to the in-place motion signal (V1)". The prior is a
-        CLIP-AGNOSTIC normalized importance map (e.g. offline predictor saliency or
-        hand-joint density), shape [t*h*w] or [h*w] (tiled over time). Only consulted
-        at the first merge layer. Robust: any missing/unreadable/mismatched file
-        returns None (=> motion fallback), so this can NEVER crash a run.
-        """
-        # --- WAM_SUPPLEMENT_PATCH_20260729 -------------------------------------------
-        # Score-family sources all route through the prior loader so the merge
-        # maths below stays identical across arms (clean single-variable ablation).
-        if source not in ("predictor_saliency", "handjoint", "flow", "egocomp",
-                          "objmotion", "random", "antiflow", "prior"):
-            return None
-        path = str(getattr(self.config, "relevance_path", "") or "")
-        if not path:
-            return None
-        # PER-CLIP store: `relevance_path` is a directory holding index.json.
-        # Returns None on ANY problem, which falls back to the motion signal.
-        if _os_.path.isdir(path):
-            try:
-                from src.models.utils import wam_prior_store as _wps
-                store = _wps.get_store(path)
-                if store is None:
-                    return None
-                arr = store.lookup(_wps.get_current_clip_keys(), int(num_tokens))
-                if arr is None or arr.shape[0] != int(batch_size):
-                    return None
-                return torch.from_numpy(arr).to(device=device, dtype=torch.float32)
-            except Exception:
-                return None
-        import os as _os
-        import numpy as _np
-        cache = getattr(self, "_wam_prior_cache", None)
-        if cache is None or cache.get("path") != path:
-            if not _os.path.exists(path):
-                return None
-            try:
-                arr = _np.load(path)
-                rel = arr["rel"] if (hasattr(arr, "files") and "rel" in arr.files) else arr
-                rel = _np.asarray(rel, dtype="float32").reshape(-1)
-            except Exception:
-                return None
-            cache = {"path": path, "rel": rel}
-            self._wam_prior_cache = cache
-        rel = cache["rel"]
-        n_thw, n_hw = int(t_grid * h_grid * w_grid), int(h_grid * w_grid)
-        if rel.shape[0] == n_thw:
-            vec = rel
-        elif rel.shape[0] == n_hw:                      # spatial prior -> tile over time
-            vec = _np.tile(rel, int(t_grid))
-        else:
-            return None                                 # shape mismatch -> motion fallback
-        if int(vec.shape[0]) != int(num_tokens):
-            return None
-        try:                                            # (B) device-level guard: never raise
-            t = torch.from_numpy(_np.ascontiguousarray(vec)).to(device=device, dtype=torch.float32)
-            return t.unsqueeze(0).expand(int(batch_size), -1).contiguous()   # [B, t*h*w]
-        except Exception:
-            return None
+# --------------------------------------------------------------------------
+# Tiny pure-python sanity helpers (no torch) so reviewers can eyeball the math
+# and so py_compile exercises real code paths. NOT part of the integration.
+# --------------------------------------------------------------------------
+def _energy_reference(cos_matrix, margin=0.0):
+    """Pure-python reference for energy_i = mean_{j!=i} relu(cos_ij - m).
 
-    @torch.no_grad()
-    def _wam_relevance(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
-        """Per-CURRENT-token task relevance in [0,1] (1 = protect hardest).
+    cos_matrix: list[list[float]] NxN. Returns list[float] length N.
+    """
+    n = len(cos_matrix)
+    out = []
+    for i in range(n):
+        acc = 0.0
+        for j in range(n):
+            if j == i:
+                continue
+            acc += max(0.0, cos_matrix[i][j] - margin)
+        out.append(acc / max(1, n - 1))
+    return out
 
-        Computed ONCE at the first merge layer (where N == num_original == t*h*w)
-        as adjacent-frame feature change (motion); cached per ORIGINAL token id.
-        At later (already-compressed) layers we GATHER the cached relevance by the
-        current tokens' original ids (token_ids), since N != t*h*w there and the
-        grid reshape in compute_importance would be invalid. Each layer is then
-        per-sample min-max normalized to [0,1] (max -> 1) so the gate is consistent.
 
-        relevance_source="motion" => compute_importance(..., "motion"); other
-        sources fall through to the same motion default for now (V1).
-        """
-        batch_size, num_tokens, _ = x.shape
-        num_original = int(rep_for_orig.shape[1])
-        source = str(getattr(self.config, "relevance_source", "motion") or "motion")
-        if source == "none":
-            source = "motion"
+def _split_sizes(n):
+    """A/B split sizes matching torch even/odd: na=ceil(n/2), nb=floor(n/2)."""
+    na = (n + 1) // 2
+    nb = n // 2
+    return na, nb
 
-        def _unit01(rel):
-            rel = rel.float().clamp_min(0.0)
-            rel = rel / rel.amax(dim=1, keepdim=True).clamp_min(1e-6)
-            return rel
 
-        # First merge layer: dense grid -> compute & cache (token_ids == arange,
-        # so the per-current-token vector IS indexed by original id).
-        if num_tokens == num_original and num_tokens == int(t_grid * h_grid * w_grid):
-            # NEW(V2): if a precomputed per-token prior is configured for this source
-            # (predictor_saliency / handjoint + relevance_path), use it; otherwise
-            # fall back to the in-place adjacent-frame motion signal (V1). Everything
-            # downstream (cache, _unit01, gate, top-r, merge) is IDENTICAL either way,
-            # so this is a pure signal-source swap (clean V1-vs-V2 ablation).
-            rel = self._load_prior_relevance(source, batch_size, num_tokens,
-                                             int(t_grid), int(h_grid), int(w_grid), x.device)
-            self._wam_rel_actual_source = "prior" if rel is not None else "motion"
-            if rel is None:
-                # (C) a prior was REQUESTED but did not load -> warn ONCE so we never
-                # silently run V1 while believing it is V2 (would corrupt the ablation).
-                if (source in ("predictor_saliency", "handjoint", "flow", "egocomp",
-                               "objmotion", "random", "antiflow", "prior")
-                        and str(getattr(self.config, "relevance_path", "") or "")
-                        and not getattr(self, "_wam_prior_warned", False)):
-                    self._wam_prior_warned = True
-                    print(f"[WAM][V2] WARNING: relevance_source={source!r} + relevance_path set, "
-                          f"but prior did NOT load -> falling back to MOTION (V1). "
-                          f"Check the .npz path/shape!", flush=True)
-                rel = compute_importance(x, int(t_grid), int(h_grid), int(w_grid),
-                                         "motion" if source not in ("norm", "norm_motion",
-                                                                    "qk_global_hidden") else source)
-            if rel is None:
-                rel = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
-            self._wam_rel_orig = rel.detach().float()              # [B, num_original]
-            return _unit01(rel)
-
-        # Later layers: gather cached relevance by current tokens' original ids.
-        cache = getattr(self, "_wam_rel_orig", None)
-        if (cache is not None and cache.shape[0] == batch_size
-                and cache.shape[1] == num_original):
-            return _unit01(cache.gather(1, token_ids))
-        # Fallback: no cache (first merge layer wasn't dense) -> no protection.
-        return torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
+if __name__ == "__main__":  # pragma: no cover - smoke check w/o torch
+    cm = [
+        [1.0, 0.9, 0.1, 0.0],
+        [0.9, 1.0, 0.2, 0.1],
+        [0.1, 0.2, 1.0, 0.95],
+        [0.0, 0.1, 0.95, 1.0],
+    ]
+    e = _energy_reference(cm, margin=0.0)
+    # token 0 and 1 are a tight pair, 2 and 3 are a tight pair; all four have a
+    # close partner so energies are similar — exercises the formula end-to-end.
+    print("energy(no margin) =", [round(v, 4) for v in e])
+    print("energy(margin .5) =", [round(v, 4) for v in _energy_reference(cm, margin=0.5)])
+    print("split_sizes(8192) =", _split_sizes(8192))
+    print("split_sizes(7)    =", _split_sizes(7))

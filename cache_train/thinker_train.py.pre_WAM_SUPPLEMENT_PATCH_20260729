@@ -637,40 +637,12 @@ def load_dense_jepa_encoder(pt_model_path=None, merge_config=None):
     return model_pt, pt_video_transform
 
 
-def encode_dense_jepa_video(video, model_pt, clip_paths=None):
-    """WAM_SUPPLEMENT_PATCH_20260729
-
-    `clip_paths` publishes this batch's clip identities so the WAM per-clip
-    relevance prior store can serve a different map per sample. It is also the
-    single place where the sensitivity ladder injects a calibrated degradation.
-    Both features are inert unless explicitly configured, so the published
-    configuration is unaffected.
-    """
-    import os as _os
-    try:
-        from src.models.utils import wam_prior_store as _wps
-        _wps.set_current_clip_keys(clip_paths)
-    except Exception:
-        pass
+def encode_dense_jepa_video(video, model_pt):
     with torch.no_grad():
         B, T, C, H, W = video.shape
         video = video.permute(0, 2, 1, 3, 4)
         out = model_pt(video)
         out = out.contiguous().view(B, T, -1, out.shape[-1])  # [B, T, P, D]
-        # Calibrated degradation for the instrument-resolution ladder. sigma is
-        # expressed in units of the batch's own feature std, so the ladder is
-        # comparable across clips and layers. Unset/0 => exact no-op.
-        try:
-            _sig = float(_os.environ.get("DENSE_JEPA_FEATURE_NOISE_STD", "") or 0.0)
-        except Exception:
-            _sig = 0.0
-        if _sig > 0.0:
-            _seed = int(_os.environ.get("DENSE_JEPA_FEATURE_NOISE_SEED", "0") or 0)
-            _g = torch.Generator(device=out.device).manual_seed(_seed)
-            _scale = out.float().std().clamp_min(1e-6)
-            _noise = torch.randn(out.shape, generator=_g, device=out.device,
-                                 dtype=torch.float32) * (_sig * _scale)
-            out = (out.float() + _noise).to(out.dtype)
     return out
 
 
@@ -2490,7 +2462,7 @@ def main(args):
                         with torch.no_grad():
                             with build_amp_autocast(enabled=use_amp):
                                 out_feats_full = encode_dense_jepa_video(
-                                    img, model_pt, clip_paths=paths
+                                    img, model_pt
                                 )  # [B,T,P,D]
             if temporal_stride > 1:
                 xyz_world = stride_time_tensor(xyz_world, temporal_stride)
@@ -3197,7 +3169,7 @@ def main(args):
                             img = fast_tx(img)
                             if img.ndim == 4:
                                 img = img.unsqueeze(0)
-                            out_feats_full = encode_dense_jepa_video(img, model_pt, clip_paths=paths)
+                            out_feats_full = encode_dense_jepa_video(img, model_pt)
                 if temporal_stride > 1:
                     xyz_world = stride_time_tensor(xyz_world, temporal_stride)
                     xyz_cam = stride_time_tensor(xyz_cam, temporal_stride)
