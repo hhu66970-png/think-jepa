@@ -19,10 +19,12 @@ import numpy as np
 
 W = Path(os.environ.get("WAM_ROOT", "/21231_data1/huhaoming_wam"))
 REPO = W / "ThinkJEPA"
-SLIM = W / "data" / "egodex_slim" / "part2"
-SPLITS = W / "tmp"                        # train_cache.txt / test_cache.txt (official 1800/200)
+# Dataset roots; the WAM_* overrides select a second dataset (e.g. the EgoDex test set) without
+# touching the defaults, which are the official part-2 subset used throughout.
+SLIM = Path(os.environ.get("WAM_SLIM", W / "data" / "egodex_slim" / "part2"))
+SPLITS = Path(os.environ.get("WAM_SPLITS", W / "tmp"))   # train_cache.txt / test_cache.txt (1800/200)
 FEAT_ROOT = Path(os.environ.get("WAM_FEAT_ROOT", W / "feats"))
-RUN_ROOT = W / "runs"
+RUN_ROOT = Path(os.environ.get("WAM_RUN_ROOT", W / "runs"))
 VITL = REPO / "vjepa2" / "vitl.pt"
 VITG = REPO / "vjepa2" / "vitg.pt"          # official V-JEPA 2 ViT-g/16 (40 blocks, d=1408)
 

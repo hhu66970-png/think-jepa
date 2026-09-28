@@ -450,3 +450,45 @@ before any test-set downstream run.
   (post-RoPE Key matching + PA + cap) wins increasingly with compression; most of the margin
   over ToMe+PA comes from the post-RoPE Key metric (kbsmpa - tomepa: ViT-L -0.03 / -0.71 /
   -1.93 at 309 / 131 / 57 tokens, ViT-g -0.41 / -0.38 / -0.69), the cap adds ~0.3-1.6.
+- 2026-09-28, NOVELTY CHECK (literature; 文献新颖性核查_postRoPE匹配_20260928.md). Closest prior
+  art: KVMerger (2024) merges LLM KV-cache entries by post-RoPE key similarity and attributes the
+  locality to RoPE (1-D, consecutive tokens only, decode-time cache); ToSA (2025) fuses spatial
+  similarity into ToMe (SigLIP, no RoPE); CubistMerge (2025) merges in RoPE backbones via
+  structured layouts (metric unspecified, no PA). No work found that compares pre- vs post-RoPE
+  keys as the merge metric inside a RoPE (video) encoder. Verdict: narrow novelty.
+- 2026-09-28, ROUND R PRE-REGISTRATION (second dataset; written before the data were downloaded).
+  Data: official EgoDex test set (test.zip, 16 GB, episodes never used here), clips built exactly
+  like part 2 (build_testset.py: whole-episode linspace-64 frames, same 52 joints, decord 256x256
+  verified against the part-2 frames), episodes >= 64 frames, at most 2500 (RandomState(2027)),
+  split 80/20 by episode (RandomState(2028)). Probe hyper-parameters unchanged (frozen).
+  Setting P1 (video + current hand pose). Budgets L9 / L12 / L15 (309 / 131 / 57 tokens);
+  ViT-L arms dense, kbsmpa, tomepa, pitomepa, caps2pa; ViT-g arms kbsmpa, tomepa, pitomepa,
+  caps2pa at gL9 / gL12 / gL15; pose-only reference; seeds 0-9 everywhere.
+  Hypotheses (the 309-token budget is descriptive only; primary cells = 131 and 57 tokens x
+  2 backbones = 4 cells):
+   H1 metric: kbsmpa - tomepa < 0 in all 4 cells, seed CI < 0 in >= 3.
+   H2 package vs published: caps2pa - min(tomepa, pitomepa) < 0 in all 4 cells; clip x seed CI
+      < 0 in both ViT-L cells; seed CI < 0 in both ViT-g cells.
+   H3 cap increment: caps2pa - kbsmpa < 0 in all 4 cells, seed CI < 0 in >= 3.
+  Decision: H2 and H3 pass -> method paper is defensible, claim restricted to <= 131 tokens and
+  RoPE video encoders; only H1/H2 pass -> "RoPE-aware matching + PA" becomes a secondary
+  contribution of the analysis paper; H2 fails -> analysis paper (plan 2), and this negative
+  replication is reported. Also reported (descriptive): VG and CG in P1 on the new data.
+  AMENDMENT (same day, still before any data): at most 2000 clips instead of 2500, because the
+  dense ViT-L bank for 2500 clips (~21 GB) does not fit a 24 GB GPU next to the probe; 2000 clips
+  (~17 GB) is the size already used. Everything else unchanged.
+- 2026-09-28, ROUND R RESULT (EgoDex official test set; 3243 episodes, 2865 >= 64 frames, 2000
+  used, 0 build failures, 1600 / 400 split, 111 tasks, median 13 clips per task; P1, seeds 0-9).
+  Descriptive: copy-last 60.88, pose-only 61.87, pose+dense 64.29 -> VG = -3.4 mm (vision does
+  NOT help on this data; median forecast horizon 3.3 s vs 1.9 s on part 2, same median motion);
+  CG (kbsmpa - dense) +1.70 / +3.41 / +4.04 at 309 / 131 / 57 tokens.
+  H1 kbsmpa - tomepa: L12 -0.13, L15 -1.51 (clip [-2.69,-0.33]), gL12 -0.20, gL15 -0.01 -> FAIL.
+  H2 caps2pa - tomepa (best published in all cells): L12 -0.91 seed [-1.76,-0.05] clip [-2.10,
+     +0.28]; L15 -0.92 clip [-2.19,+0.34]; gL12 -0.60 seed [-1.19,-0.02]; gL15 -0.76 seed [-1.46,
+     -0.06] -> FAIL (ViT-L clip CIs cross 0).
+  H3 caps2pa - kbsmpa: L12 -0.78, L15 +0.58, gL12 -0.41, gL15 -0.75 -> FAIL.
+  DECISION (pre-registered): analysis paper (plan 2); the negative replication is reported.
+  Interpretation: the P1 headroom of part 2 (13 tasks, 138 clips per task) does not transfer to
+  a task-diverse split (111 tasks): the vision probe overfits and falls below copy-last, so
+  merger differences here measure how much each merger degrades an unhelpful signal.
+  The published baselines are still never better than caps2pa in mean (12/12 cells incl. 309).
