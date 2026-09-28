@@ -415,3 +415,38 @@ before any test-set downstream run.
   budgets with seed CI < 0 at >= 2, and BPM mean below tomepa and pitomepa at >= 2 budgets;
   (iii) M3: mean < 0 at all three budgets and clip x seed CI < 0 at >= 2. The already known
   P1 test result (clip CI < 0 vs kbsmpa at 1/3 budgets) stays reported as is.
+- 2026-09-28, ROUND M RESULT (interim; ViT-g gs25 still re-running after OOM - another user's
+  services now occupy 8.4 GB on GPUs 0-3; failed jobs re-queued at 1 job per busy GPU).
+  P1 test, caps2pa - baseline (mm, clip x seed CI):
+  ViT-L s25: vs kbsmpa -0.24 [-1.14,+0.61], vs tomepa +0.06, vs pitomepa -0.39 (no gap to close:
+     dense 53.20, kbsmpa 53.46). L9: vs kbsmpa -1.03 [-2.02,-0.16], tomepa -1.06 [-2.38,+0.20],
+     pitomepa -1.87 [-3.11,-0.73]. L12: kbsmpa -1.17 [-2.50,+0.15], tomepa -1.87 [-3.32,-0.45],
+     pitomepa -2.37 [-3.70,-1.12].
+  ViT-g gL9: vs kbsmpa +0.09 [-0.90,+1.05], tomepa -0.15, pitomepa -0.75; gL12: kbsmpa -0.52
+     seed [-1.02,-0.02], tomepa -1.21, pitomepa -2.47 [-4.30,-0.77].
+  M3 CV P1 (1620 clips): s25 -0.43 [-0.94,+0.08]; L9 -0.97 [-1.50,-0.44]; L12 -0.86 [-1.49,-0.23].
+  METHOD-PAPER RULE: (i) FAIL (s25), (ii) FAIL (ViT-g gL9 null), (iii) PASS -> rule NOT met.
+  POST-HOC observation (not a claim): BPM helps where compression costs accuracy (ViT-L <= 309,
+  ViT-g 131 tokens) and is null where the dense-compressed gap is ~0.
+- 2026-09-28, ROUND N PRE-REGISTRATION (fresh confirmation of the post-hoc "high-compression"
+  reading; written before the remaining ViT-g gs25 results). New budget never evaluated before:
+  L15 (ViT-L layers 8-22) and gL15 (ViT-g blocks 10-38 step 2), 15 merges -> 57 tokens.
+  P1 test; arms kbsmpa, caps2pa (seeds 0-19), tomepa, pitomepa (seeds 0-9); ViT-L also dense.
+  CONFIRMED only if on BOTH backbones BPM's mean is below all three baselines, and BPM - best
+  baseline has clip x seed CI < 0 on ViT-L and seed CI < 0 on ViT-g. If confirmed, the method
+  claim is restricted to the high-compression regime (<= ~130 tokens) and says so; if not,
+  the recommendation stays an analysis paper. No further budgets or variants after round N.
+- 2026-09-28, ROUND M FINAL (ViT-g gs25 re-run complete, 0 failures): gs25 caps2pa - kbsmpa
+  +0.19 [-0.05,+0.44] seed; - tomepa -0.16; - pitomepa +0.06. Rule unchanged: NOT met.
+- 2026-09-28, ROUND N RESULT (57 tokens, P1 test). ViT-L L15: kbsmpa 60.18, tomepa 62.14,
+  pitomepa 60.77, caps2pa 58.99, dense 53.20 (compression gap of kbsmpa +7.0). caps2pa - kbsmpa
+  -1.19 seed [-1.63,-0.76] clip [-3.24,+0.72]; - tomepa -3.54 clip [-5.78,-1.43]; - pitomepa
+  -2.18 clip [-4.26,-0.16]. ViT-g gL15: kbsmpa 60.78, tomepa 61.67, pitomepa 64.22, caps2pa
+  60.48; caps2pa - kbsmpa -0.30 seed [-0.97,+0.37]; - tomepa -1.45 seed [-2.09,-0.81];
+  - pitomepa -4.00 clip [-6.56,-1.57]. RULE: mean below all baselines on both backbones (yes),
+  clip CI vs best baseline (kbsmpa) on ViT-L (no), seed CI vs kbsmpa on ViT-g (no) ->
+  NOT CONFIRMED. Per pre-registration: no further budgets or variants of the cap.
+  Descriptive (not pre-registered as a claim): against the published baselines the pipeline
+  (post-RoPE Key matching + PA + cap) wins increasingly with compression; most of the margin
+  over ToMe+PA comes from the post-RoPE Key metric (kbsmpa - tomepa: ViT-L -0.03 / -0.71 /
+  -1.93 at 309 / 131 / 57 tokens, ViT-g -0.41 / -0.38 / -0.69), the cap adds ~0.3-1.6.
