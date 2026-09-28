@@ -397,3 +397,21 @@ before any test-set downstream run.
   clip [-2.51,+0.15] 19/20. Pre-registered rule NOT MET (clip CI < 0 at 1/3 budgets), the
   same pattern as A2. Gap closed by caps2pa: L9 73 % (caps2pa - dense +0.46 n.s.), L12 31 %.
   PA in P1: kbsmpa_L9 - kbsm_L9 = +0.34 [-0.44,+1.12] (no PA benefit in this setting).
+- 2026-09-28, ROUND M PRE-REGISTRATION (P1 baselines + decisive method-paper test), fixed
+  before any result of this round. Setting P1 (video + current hand pose, --pose_frames 1).
+  New baselines: tomepa = ToMe metric (head-mean key BEFORE RoPE, bsm_match_metric=key_prerope)
+  + PA; pitomepa = PiToMe (codebase implementation) + PA. Sanity (test_tome.py): same K at all
+  budgets, finite, groupings differ from K-BSM (rep agreement 0.4-11 %); default paths still
+  bit-exact (test_prop_attn T3 vs ee09031, smoke_exact, test_capacity C3).
+  Candidate method BPM = caps2pa (k = 2 fixed; no new variants, no tuning).
+  M1 ViT-L P1 test: tomepa, pitomepa at s25/L9/L12, seeds 0-19 (kbsmpa, caps2pa, dense exist).
+  M2 ViT-g P1 test (schedules gs25 / gL9 / gL12 = 972 / 309 / ~131 tokens, rows_from
+     vitg_kbsm_gL9): kbsmpa and caps2pa seeds 0-19; tomepa, pitomepa seeds 0-9; kbsm_gL9 seeds
+     0-9. Dense ViT-g cannot be probed on a 24 GB GPU (23 GB bank) -> no ViT-g CG.
+  M3 ViT-L P1 5-fold CV over the 1620 non-selection train clips: caps2pa vs kbsmpa, s25/L9/L12,
+     seeds 0-3 (independent of every test result).
+  METHOD-PAPER RULE for BPM (all three needed): (i) ViT-L P1: BPM mean below each of kbsmpa,
+  tomepa, pitomepa at all three budgets; (ii) ViT-g P1: BPM - kbsmpa mean < 0 at all three
+  budgets with seed CI < 0 at >= 2, and BPM mean below tomepa and pitomepa at >= 2 budgets;
+  (iii) M3: mean < 0 at all three budgets and clip x seed CI < 0 at >= 2. The already known
+  P1 test result (clip CI < 0 vs kbsmpa at 1/3 budgets) stays reported as is.

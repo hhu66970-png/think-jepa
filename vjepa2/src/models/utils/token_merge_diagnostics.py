@@ -180,7 +180,7 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             )
 
         # -- Matching metric (UNCHANGED from K-BSM) --------------------------
-        want_key = str(getattr(self.config, "bsm_match_metric", "key")) == "key"
+        want_key = str(getattr(self.config, "bsm_match_metric", "key")) in ("key", "key_prerope")
         if str(getattr(self.config, "bsm_match_metric", "key")) == "learned":
             if MATCHER is None:
                 raise RuntimeError("bsm_match_metric='learned' but no matcher was set")
@@ -205,7 +205,7 @@ class DiagnosticTokenMerger(LocalTokenMerger):
             and attn_key.shape[1] == num_tokens
         ):
             metric_src = attn_key.float()
-            match_metric = "key"
+            match_metric = str(getattr(self.config, "bsm_match_metric", "key"))
             fallback_reason = None
         else:
             metric_src = x.float()

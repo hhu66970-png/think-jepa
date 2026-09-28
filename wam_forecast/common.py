@@ -39,6 +39,7 @@ SCHEDULES = {
     # ViT-g (40 blocks): same number of merges at the same relative depth (50-90 %)
     "gs25": ("20,24,28,32,36", 0.25),
     "gL9": ("20,22,24,26,28,30,32,34,36", 0.25),
+    "gL12": ("14,16,18,20,22,24,26,28,30,32,34,36", 0.25),   # 12 merges, ~131 tokens
     # direction A: global path at ~232 tokens, 128-px hand crops (1024 tokens) at ~43 / ~77
     "L10g": ("12,13,14,15,16,17,18,19,20,21", 0.25),
     "c11": ("11,12,13,14,15,16,17,18,19,20,21", 0.25),
@@ -132,6 +133,9 @@ METHODS.update({f"caps{k}pa": dict(_KPA, bsm_cap_size=float(k)) for k in (2, 4, 
 METHODS["capinfpa"] = dict(_KPA, bsm_cap_count=10 ** 6)
 # A4b mechanism: the same cap WITHOUT proportional attention (reference: kbsm)
 METHODS["caps2"] = dict(METHODS["kbsm"], bsm_cap_size=2.0)
+# P1 baselines: original ToMe metric (head-mean key BEFORE RoPE) and PiToMe, both with PA
+METHODS["tomepa"] = dict(strategy="bsm_ksim_gradual_vec", bsm_match_metric="key_prerope", prop_attn=True)
+METHODS["pitomepa"] = dict(METHODS["pitome"], prop_attn=True)
 
 
 def merge_config(method: str, sched: str):

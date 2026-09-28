@@ -372,6 +372,8 @@ class RoPEAttention(nn.Module):
 
         qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
+        stash_mode = getattr(self, "_stash_attn_key", False)
+        pre_rope_key = k.detach().mean(dim=1) if stash_mode == "pre" else None   # ToMe metric
 
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
@@ -416,7 +418,9 @@ class RoPEAttention(nn.Module):
         #    and every non-BSM path leave this flag False and pay nothing. The
         #    flag/stash are plain instance attrs (not buffers/params) so they are
         #    invisible to state_dict, _init_weights and _rescale_blocks.
-        if getattr(self, "_stash_attn_key", False):
+        if stash_mode == "pre":
+            self._stashed_key = pre_rope_key
+        elif stash_mode:
             # mean over heads -> [B, N, head_dim], detached. Mean-over-heads is
             # the standard ToMe recipe and keeps the metric one vector per token.
             self._stashed_key = k.detach().mean(dim=1)

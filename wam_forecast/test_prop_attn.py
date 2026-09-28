@@ -81,7 +81,7 @@ print(f"     L9 final group sizes: mean {float(size_k.mean()):.1f}, max {float(s
 check("T3 prop_attn changes encoder output", float((out_k - out_pa).abs().max()) > 1e-2,
       f"max|kbsm - kbsmpa| = {float((out_k - out_pa).abs().max()):.3e}")
 
-src = subprocess.run(["git", "-C", str(REPO), "show", "HEAD:vjepa2/src/models/vision_transformer.py"],
+src = subprocess.run(["git", "-C", str(REPO), "show", "ee09031:vjepa2/src/models/vision_transformer.py"],
                      capture_output=True, text=True, check=True).stdout
 path = REPO / "vjepa2/src/models/_vt_head_tmp.py"
 path.write_text(src)
@@ -93,8 +93,8 @@ try:
     head.load_state_dict(enc.state_dict(), strict=True)
     head = head.cuda().eval()
     out_h, _ = run(head, merge_config("kbsm", "L9"))
-    check("T3 prop_attn=False == HEAD encoder (bit-exact)", torch.equal(out_h, out_k),
-          f"max|HEAD - patched| = {float((out_h - out_k).abs().max()):.1e}")
+    check("T3 prop_attn=False == original (ee09031) encoder (bit-exact)", torch.equal(out_h, out_k),
+          f"max|orig - patched| = {float((out_h - out_k).abs().max()):.1e}")
 finally:
     path.unlink()
 

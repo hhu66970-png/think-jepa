@@ -274,14 +274,16 @@ class VisionTransformer(nn.Module):
             merge_enabled
             and getattr(self.merge_config, "strategy", "")
             in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec")
-            and getattr(self.merge_config, "bsm_match_metric", "key") == "key"
+            and getattr(self.merge_config, "bsm_match_metric", "key") in ("key", "key_prerope")
         )
+        # "key_prerope" = the original ToMe metric: head-mean key BEFORE the rotary embedding
+        stash_mode = "pre" if getattr(self.merge_config, "bsm_match_metric", "key") == "key_prerope" else True
         if merge_enabled:
             merge_layer_set = set(int(j) for j in self.merge_config.merge_layers)
             for j, blk_j in enumerate(self.blocks):
                 attn_j = getattr(blk_j, "attn", None)
                 if attn_j is not None:
-                    attn_j._stash_attn_key = bool(bsm_key_metric and j in merge_layer_set)
+                    attn_j._stash_attn_key = stash_mode if (bsm_key_metric and j in merge_layer_set) else False
 
         # Fwd prop
         outs = []

@@ -119,7 +119,7 @@ def corr(split):
     write_json(out, OUT / f"corr_{split}.json")
 
 
-def cv(arm="caps2pa", ref="kbsmpa", budgets="L9,L12,s25"):
+def cv(arm="caps2pa", ref="kbsmpa", budgets="L9,L12,s25", inp="vis"):
     """A2b: pooled 5-fold CV over the 1620 non-selection train clips (runs/cv/<cfg>/vis_cv<f>)."""
     res = {}
     for b in budgets.split(","):
@@ -127,7 +127,7 @@ def cv(arm="caps2pa", ref="kbsmpa", budgets="L9,L12,s25"):
         for m in (arm, ref):
             seeds = {}
             for f in range(5):
-                for mf in (RUN_ROOT / "cv" / f"{m}_{b}" / f"vis_cv{f}").glob("s*/metrics.json"):
+                for mf in (RUN_ROOT / "cv" / f"{m}_{b}" / f"{inp}_cv{f}").glob("s*/metrics.json"):
                     sd = json.loads(mf.read_text())["seed"]
                     seeds.setdefault(sd, {})[f] = (np.load(mf.parent / "eval_rows.npy"),
                                                   np.load(mf.parent / "perclip_ade.npy"))
@@ -159,7 +159,7 @@ def cv(arm="caps2pa", ref="kbsmpa", budgets="L9,L12,s25"):
               f"seedCI=[{r['seed_ci'][0]:+.3f},{r['seed_ci'][1]:+.3f}] clipCI=[{r['clip_ci'][0]:+.3f},"
               f"{r['clip_ci'][1]:+.3f}] wins={r['wins']}/{r['n_seeds']}")
     OUT.mkdir(parents=True, exist_ok=True)
-    write_json(res, OUT / f"cv_{arm}_vs_{ref}.json")
+    write_json(res, OUT / f"cv_{arm}_vs_{ref}{'' if inp == 'vis' else '_' + inp}.json")
 
 
 if __name__ == "__main__":
