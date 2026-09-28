@@ -289,6 +289,8 @@ class VisionTransformer(nn.Module):
         seen_merge = False
         for i, blk in enumerate(self.blocks):
             if self.use_activation_checkpointing:
+                if merge_enabled and bool(getattr(self.merge_config, "prop_attn", False)):
+                    raise NotImplementedError("prop_attn is not wired into the activation-checkpointing path")
                 x = torch.utils.checkpoint.checkpoint(
                     blk,
                     x,
@@ -300,10 +302,17 @@ class VisionTransformer(nn.Module):
                     use_reentrant=False,
                 )
             else:
+                # Optional ToMe proportional attention: after the first merge, every key gets a
+                # log(size) logit bias so a merged group keeps the attention mass of the tokens it
+                # stands for. Off by default (published configs pass attn_mask=None, unchanged).
+                attn_bias = None
+                if merge_enabled and seen_merge and bool(getattr(self.merge_config, "prop_attn", False)):
+                    bdt = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else x.dtype
+                    attn_bias = token_size.float().clamp_min(1.0).log()[:, None, None, :].to(bdt)
                 x = blk(
                     x,
                     mask=token_ids if merge_enabled else masks,
-                    attn_mask=None,
+                    attn_mask=attn_bias,
                     T=T,
                     H_patches=H_patches,
                     W_patches=W_patches,
@@ -373,6 +382,9 @@ class VisionTransformer(nn.Module):
             _profile_now(profile_device, profile_enabled) - norm_start
         ) * 1000.0
 
+        # Expose the final merge state so callers can cache compressed tokens together
+        # with their representative map (read-only; does not change any output).
+        self.last_merge_state = (token_ids, token_size, rep_for_orig) if merge_enabled else None
         restore_start = _profile_now(profile_device, profile_enabled)
         if merge_enabled and restore_dense:
             x = restore_dense_tokens(x, token_ids, rep_for_orig, original_num_tokens)

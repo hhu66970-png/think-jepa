@@ -70,6 +70,42 @@ class MergeConfig:
     # and broadcast to [B, t*h*w] (clip-agnostic prior). Empty => fall back to the
     # in-place "motion" signal (V1). The gate/topk/merge logic is UNCHANGED.
     relevance_path: str = ""
+    # WAM-v2 knobs (CVPR). Defaults reproduce the published WAM exactly.
+    #   relevance_norm        max (published: r / max r over current tokens) | rank
+    #   relevance_first_frame zero (published: motion[:,0]=0) | ffill (r_0 := r_1)
+    #   relevance_comp        none | median (subtract the per-frame spatial median of the
+    #                         raw motion, clamp at 0: removes the spatially uniform
+    #                         component that camera motion induces)
+    #   relevance_prop        self (published: representative's own score) | max | mean
+    #                         over the ORIGINAL tokens its group contains
+    #   relevance_gate        mult (published: S*g_a*g_b) | signsafe ((1+S)/2*g_a*g_b) |
+    #                         source (S*g_a) | add (S - beta*lam*(r_a+r_b)) |
+    #                         quota (hard: edges touching the top relevance_quota fraction
+    #                         of current tokens are never selected)
+    relevance_norm: str = "max"
+    relevance_first_frame: str = "zero"
+    relevance_comp: str = "none"
+    relevance_prop: str = "self"
+    relevance_gate: str = "mult"
+    relevance_beta: float = 1.0
+    relevance_quota: float = 0.1
+    # Order-preserving protection (CVPR v3). Both keep K-BSM's similarity order.
+    #   relevance_partition  none | recv : tokens with relevance > 0.5 are never sources
+    #                        (they join the receiver set, so they can absorb but never vanish)
+    #   relevance_anchor     beta >= 0 : merge by weights size*(1+beta*relevance), so a merged
+    #                        group's feature stays close to its relevant members
+    relevance_partition: str = "none"
+    relevance_anchor: float = 0.0
+    # ToMe proportional attention inside the encoder after merging (log size key bias).
+    prop_attn: bool = False
+    # Balanced-group-size K-BSM (Phase A). Similarity rule unchanged; edge selection is
+    # capacity-constrained (greedy in K-BSM score order, rejected sources re-pick among
+    # non-full receivers), so exactly r tokens are still removed per layer. 0 = off.
+    #   bsm_cap_count  max #sources one receiver may absorb in ONE merge layer
+    #   bsm_cap_size   max group size (original tokens) after the layer, as a multiple of
+    #                  the mean group size after that layer (budget-invariant)
+    bsm_cap_count: int = 0
+    bsm_cap_size: float = 0.0
 
 
 def normalize_merge_config(config):
@@ -167,6 +203,18 @@ def normalize_merge_config(config):
         relevance_lambda=float(config.get("relevance_lambda", 1.0)),
         relevance_power=float(config.get("relevance_power", 1.0)),
         relevance_path=str(config.get("relevance_path", "")),
+        relevance_norm=str(config.get("relevance_norm", "max")),
+        relevance_first_frame=str(config.get("relevance_first_frame", "zero")),
+        relevance_comp=str(config.get("relevance_comp", "none")),
+        relevance_prop=str(config.get("relevance_prop", "self")),
+        relevance_gate=str(config.get("relevance_gate", "mult")),
+        relevance_beta=float(config.get("relevance_beta", 1.0)),
+        relevance_quota=float(config.get("relevance_quota", 0.1)),
+        relevance_partition=str(config.get("relevance_partition", "none")),
+        relevance_anchor=float(config.get("relevance_anchor", 0.0)),
+        prop_attn=bool(config.get("prop_attn", False)),
+        bsm_cap_count=int(config.get("bsm_cap_count", 0)),
+        bsm_cap_size=float(config.get("bsm_cap_size", 0.0)),
     )
     _validate_merge_config(normalized)
     return normalized
@@ -199,6 +247,23 @@ def _validate_merge_config(config):
         raise ValueError(
             f"merge_axis must be one of free|spatial|temporal, got {config.merge_axis!r}"
         )
+    for field, allowed in (("relevance_norm", ("max", "rank")),
+                           ("relevance_first_frame", ("zero", "ffill")),
+                           ("relevance_comp", ("none", "median")),
+                           ("relevance_prop", ("self", "max", "mean")),
+                           ("relevance_gate", ("mult", "signsafe", "source", "add", "quota"))):
+        if getattr(config, field) not in allowed:
+            raise ValueError(f"{field} must be one of {'|'.join(allowed)}, got {getattr(config, field)!r}")
+    if config.relevance_partition not in ("none", "recv", "excl"):
+        raise ValueError(f"relevance_partition must be none|recv|excl, got {config.relevance_partition!r}")
+    if config.relevance_anchor < 0.0:
+        raise ValueError("relevance_anchor must be >= 0")
+    if config.bsm_cap_count < 0 or config.bsm_cap_size < 0.0:
+        raise ValueError("bsm_cap_count / bsm_cap_size must be >= 0 (0 = off)")
+    if 0.0 < config.bsm_cap_size < 1.0:
+        raise ValueError("bsm_cap_size is a multiple of the mean group size and must be >= 1")
+    if not 0.0 <= config.relevance_quota < 1.0:
+        raise ValueError("relevance_quota must be in [0,1)")
     if config.strategy == "bsm_pitome_gradual_vec" and config.pitome_margin < 0.0:
         raise ValueError("pitome_margin must be >= 0.0")
 
