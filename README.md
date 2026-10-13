@@ -35,6 +35,16 @@ This branch holds the code only. Data, cached features, run outputs, and figure 
    (seeds fixed in the file); `build_diving.py` and `build_diving2.py` prepare Diving48.
 4. Cache features with `extract.py`, then run the probes with `make_jobs.py` and `gpu_pool.py`, as in `drivers/`.
 
+## Dependencies outside this repository
+
+- `src.models...` in `extract.py` and the analysis scripts is the V-JEPA 2 code base (step 1 of the setup).
+- The EgoDex clips are read from the ThinkJEPA EgoDex part 2 cache (`$WAM_ROOT/data/egodex_slim/part2`, with the
+  1800/200 split files `train_cache.txt` and `test_cache.txt` under `$WAM_SPLITS`).
+- `build_testset.py` and `build_fps.py` (only needed to rebuild the held out episodes) import `egodex/` and
+  `cache_train/hf_egodex.py` from the ThinkJEPA release; they are in the history of this repository (commit `df271bf`)
+  and keep their own license. Point `REPO_ROOT` at a checkout that contains them.
+- `WAM_VITG` may point to the official `vitg.pt`; an encoder only copy is optional.
+
 ## Tests
 
 Run from `wam_forecast/`; tests that check results exit nonzero on failure.
