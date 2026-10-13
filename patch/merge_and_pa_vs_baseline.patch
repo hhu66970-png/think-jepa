@@ -1,0 +1,980 @@
+diff --git a/vjepa2/src/models/utils/modules.py b/vjepa2/src/models/utils/modules.py
+index 9a4a545..bdf033b 100644
+--- a/vjepa2/src/models/utils/modules.py
++++ b/vjepa2/src/models/utils/modules.py
+@@ -372,6 +372,8 @@ class RoPEAttention(nn.Module):
+ 
+         qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
++        stash_mode = getattr(self, "_stash_attn_key", False)
++        pre_rope_key = k.detach().mean(dim=1) if stash_mode == "pre" else None   # ToMe metric
+ 
+         if mask is not None:
+             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
+@@ -416,13 +418,30 @@ class RoPEAttention(nn.Module):
+         #    and every non-BSM path leave this flag False and pay nothing. The
+         #    flag/stash are plain instance attrs (not buffers/params) so they are
+         #    invisible to state_dict, _init_weights and _rescale_blocks.
+-        if getattr(self, "_stash_attn_key", False):
++        if stash_mode == "pre":
++            self._stashed_key = pre_rope_key
++        elif stash_mode:
+             # mean over heads -> [B, N, head_dim], detached. Mean-over-heads is
+             # the standard ToMe recipe and keeps the metric one vector per token.
+             self._stashed_key = k.detach().mean(dim=1)
+         else:
+             self._stashed_key = None
+ 
++        # -- Optional vid-TLDR saliency stash (round T): sum_j p log p of the HEAD-AVERAGED attention
++        #    probabilities (without the proportional attention bias), as vid-TLDR get_objective_score.
++        #    Off unless _stash_attn_entropy is set at a merge layer; every other path pays nothing.
++        if getattr(self, "_stash_attn_entropy", False):
++            with torch.no_grad():
++                p_mean = None
++                for hh in range(q.shape[1]):
++                    ph = ((q[:, hh].float() @ k[:, hh].float().transpose(-1, -2)) * self.scale).softmax(dim=-1)
++                    p_mean = ph if p_mean is None else p_mean + ph
++                p_mean = p_mean / q.shape[1]
++                self._stashed_entropy = torch.special.xlogy(p_mean, p_mean).sum(dim=-1)   # [B, N]
++                del p_mean
++        else:
++            self._stashed_entropy = None
++
+         if attn_mask is not None or self.use_sdpa:
+             with torch.backends.cuda.sdp_kernel():
+                 x = F.scaled_dot_product_attention(
+@@ -669,6 +688,9 @@ class Block(nn.Module):
+         else:
+             y = self.attn(self.norm1(x), mask=mask, attn_mask=attn_mask)
+         x = x + self.drop_path(y)
++        hook = getattr(self, "_mid_merge", None)     # round N: merge between attention and MLP (vid-TLDR placement)
++        if hook is not None:
++            x = hook(x)
+         x = x + self.drop_path(self.mlp(self.norm2(x)))
+         return x
+ 
+diff --git a/vjepa2/src/models/utils/token_merge.py b/vjepa2/src/models/utils/token_merge.py
+index 49a552c..95c0ecd 100644
+--- a/vjepa2/src/models/utils/token_merge.py
++++ b/vjepa2/src/models/utils/token_merge.py
+@@ -1,6 +1,9 @@
+ import math
+ from dataclasses import dataclass
+ 
++import os as _os
++# tenth review, round FUSE: WAM_LEAN=1 skips host synchronising diagnostics (timing only; values unchanged)
++LEAN = _os.environ.get("WAM_LEAN", "0") == "1"
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -49,6 +52,10 @@ class MergeConfig:
+     # PiToMe energy anchor budget. If N > this, energy uses N x anchors subsample
+     # (O(N*anchors)); <=0 => always full O(N^2).
+     pitome_energy_max_anchors: int = 2048
++    # Published PiToMe (Tran et al., NeurIPS 2024, official vision code): exact ELU energy with the
++    # per-block margin 0.75 (1 - l / L), top-2r mergeable tokens split alternately into A/B, the rest
++    # protected. False (default) keeps the earlier energy-halves variant bit for bit.
++    pitome_official: bool = False
+     # Pre-existing harness fields, currently MISSING from the dataclass+normalizer
+     # (run_token_merge_pca_experiment.py passes them; today they are dropped).
+     bsm_partition: str = "positional"
+@@ -70,6 +77,53 @@ class MergeConfig:
+     # and broadcast to [B, t*h*w] (clip-agnostic prior). Empty => fall back to the
+     # in-place "motion" signal (V1). The gate/topk/merge logic is UNCHANGED.
+     relevance_path: str = ""
++    # WAM-v2 knobs (CVPR). Defaults reproduce the published WAM exactly.
++    #   relevance_norm        max (published: r / max r over current tokens) | rank
++    #   relevance_first_frame zero (published: motion[:,0]=0) | ffill (r_0 := r_1)
++    #   relevance_comp        none | median (subtract the per-frame spatial median of the
++    #                         raw motion, clamp at 0: removes the spatially uniform
++    #                         component that camera motion induces)
++    #   relevance_prop        self (published: representative's own score) | max | mean
++    #                         over the ORIGINAL tokens its group contains
++    #   relevance_gate        mult (published: S*g_a*g_b) | signsafe ((1+S)/2*g_a*g_b) |
++    #                         source (S*g_a) | add (S - beta*lam*(r_a+r_b)) |
++    #                         quota (hard: edges touching the top relevance_quota fraction
++    #                         of current tokens are never selected)
++    relevance_norm: str = "max"
++    relevance_first_frame: str = "zero"
++    relevance_comp: str = "none"
++    # Controls for the priority signal (advisor review): applied to the motion score on the dense grid.
++    #   none | shuffle (permute scores over all positions of a clip: same distribution, no correspondence)
++    #   | shuffle_frame (permute within each frame: keeps the temporal profile, destroys spatial layout)
++    #   | invert (max - score: protect the least changing tokens)
++    relevance_transform: str = "none"
++    # round T: "vidtldr" weights each merged source by its vid-TLDR saliency (attention sharpness)
++    saliency_weight: str = "none"
++    # rounds N: "mid" merges between attention and MLP; "official" reorders survivors as vid-TLDR
++    merge_point: str = "post"
++    merge_order: str = "keep"
++    merge_counts: tuple = ()
++    relevance_prop: str = "self"
++    relevance_gate: str = "mult"
++    relevance_beta: float = 1.0
++    relevance_quota: float = 0.1
++    # Order-preserving protection (CVPR v3). Both keep K-BSM's similarity order.
++    #   relevance_partition  none | recv : tokens with relevance > 0.5 are never sources
++    #                        (they join the receiver set, so they can absorb but never vanish)
++    #   relevance_anchor     beta >= 0 : merge by weights size*(1+beta*relevance), so a merged
++    #                        group's feature stays close to its relevant members
++    relevance_partition: str = "none"
++    relevance_anchor: float = 0.0
++    # ToMe proportional attention inside the encoder after merging (log size key bias).
++    prop_attn: bool = False
++    # Balanced-group-size K-BSM (Phase A). Similarity rule unchanged; edge selection is
++    # capacity-constrained (greedy in K-BSM score order, rejected sources re-pick among
++    # non-full receivers), so exactly r tokens are still removed per layer. 0 = off.
++    #   bsm_cap_count  max #sources one receiver may absorb in ONE merge layer
++    #   bsm_cap_size   max group size (original tokens) after the layer, as a multiple of
++    #                  the mean group size after that layer (budget-invariant)
++    bsm_cap_count: int = 0
++    bsm_cap_size: float = 0.0
+ 
+ 
+ def normalize_merge_config(config):
+@@ -160,6 +214,7 @@ def normalize_merge_config(config):
+         merge_axis=str(config.get("merge_axis", "free")),
+         pitome_margin=float(config.get("pitome_margin", 0.0)),
+         pitome_energy_max_anchors=int(config.get("pitome_energy_max_anchors", 2048)),
++        pitome_official=bool(config.get("pitome_official", False)),
+         bsm_partition=str(config.get("bsm_partition", "positional")),
+         pre_merge_ratio=float(config.get("pre_merge_ratio", 0.0)),
+         bsm_protect_ratio=float(config.get("bsm_protect_ratio", 0.0)),
+@@ -167,6 +222,23 @@ def normalize_merge_config(config):
+         relevance_lambda=float(config.get("relevance_lambda", 1.0)),
+         relevance_power=float(config.get("relevance_power", 1.0)),
+         relevance_path=str(config.get("relevance_path", "")),
++        relevance_norm=str(config.get("relevance_norm", "max")),
++        relevance_first_frame=str(config.get("relevance_first_frame", "zero")),
++        relevance_comp=str(config.get("relevance_comp", "none")),
++        relevance_transform=str(config.get("relevance_transform", "none")),
++        saliency_weight=str(config.get("saliency_weight", "none")),
++        merge_point=str(config.get("merge_point", "post")),
++        merge_order=str(config.get("merge_order", "keep")),
++        merge_counts=tuple(int(c) for c in config.get("merge_counts", ())),
++        relevance_prop=str(config.get("relevance_prop", "self")),
++        relevance_gate=str(config.get("relevance_gate", "mult")),
++        relevance_beta=float(config.get("relevance_beta", 1.0)),
++        relevance_quota=float(config.get("relevance_quota", 0.1)),
++        relevance_partition=str(config.get("relevance_partition", "none")),
++        relevance_anchor=float(config.get("relevance_anchor", 0.0)),
++        prop_attn=bool(config.get("prop_attn", False)),
++        bsm_cap_count=int(config.get("bsm_cap_count", 0)),
++        bsm_cap_size=float(config.get("bsm_cap_size", 0.0)),
+     )
+     _validate_merge_config(normalized)
+     return normalized
+@@ -199,6 +271,27 @@ def _validate_merge_config(config):
+         raise ValueError(
+             f"merge_axis must be one of free|spatial|temporal, got {config.merge_axis!r}"
+         )
++    for field, allowed in (("relevance_norm", ("max", "rank")),
++                           ("relevance_first_frame", ("zero", "ffill")),
++                           ("relevance_comp", ("none", "median")),
++                           ("relevance_transform", ("none", "shuffle", "shuffle_frame", "invert")),
++                           ("saliency_weight", ("none", "vidtldr", "vidtldr_shuffle", "drop")),
++                           ("merge_point", ("post", "mid")),
++                           ("merge_order", ("keep", "official")),
++                           ("relevance_prop", ("self", "max", "mean")),
++                           ("relevance_gate", ("mult", "signsafe", "source", "add", "quota"))):
++        if getattr(config, field) not in allowed:
++            raise ValueError(f"{field} must be one of {'|'.join(allowed)}, got {getattr(config, field)!r}")
++    if config.relevance_partition not in ("none", "recv", "excl", "seg"):
++        raise ValueError(f"relevance_partition must be none|recv|excl|seg, got {config.relevance_partition!r}")
++    if config.relevance_anchor < 0.0:
++        raise ValueError("relevance_anchor must be >= 0")
++    if config.bsm_cap_count < 0 or config.bsm_cap_size < 0.0:
++        raise ValueError("bsm_cap_count / bsm_cap_size must be >= 0 (0 = off)")
++    if 0.0 < config.bsm_cap_size < 1.0:
++        raise ValueError("bsm_cap_size is a multiple of the mean group size and must be >= 1")
++    if not 0.0 <= config.relevance_quota < 1.0:
++        raise ValueError("relevance_quota must be in [0,1)")
+     if config.strategy == "bsm_pitome_gradual_vec" and config.pitome_margin < 0.0:
+         raise ValueError("pitome_margin must be >= 0.0")
+ 
+@@ -1085,6 +1178,8 @@ class LocalTokenMerger(nn.Module):
+         num_accepted=None,
+         decision_dump=None,
+     ):
++        if LEAN:                                     # tenth review, round FUSE: no host synchronising diagnostics
++            return {}
+         before = int(x_before.shape[1])
+         after = int(x_after.shape[1])
+         ratio = float(after / max(1, before))
+diff --git a/vjepa2/src/models/utils/token_merge_diagnostics.py b/vjepa2/src/models/utils/token_merge_diagnostics.py
+index 4644af1..169ba07 100644
+--- a/vjepa2/src/models/utils/token_merge_diagnostics.py
++++ b/vjepa2/src/models/utils/token_merge_diagnostics.py
+@@ -21,7 +21,57 @@ import os as _os_   # WAM_SUPPLEMENT_PATCH_20260729
+ import torch
+ import torch.nn.functional as F
+ 
+-from src.models.utils.token_merge import LocalTokenMerger, compute_importance
++from src.models.utils.token_merge import LEAN, LocalTokenMerger, compute_importance
++
++# Per-batch external relevance [B, t*h*w] set by the caller right before a forward pass
++# (relevance_source="external"), e.g. the projection of the OBSERVED past hand poses.
++EXTERNAL_RELEVANCE = None
++
++
++def vidtldr_objective(neg_entropy):
++    """vid-TLDR get_objective_score (official code, utils/vid_TLDR.py) on [B, N] = sum_j p log p of the
++    head-averaged attention: background removing (below-mean tokens -> 0) and foreground sharpening."""
++    s = neg_entropy - neg_entropy.amin(dim=1, keepdim=True)
++    s = s / s.amax(dim=1, keepdim=True).clamp_min(1e-12)
++    mask = s < s.mean(dim=1, keepdim=True)
++    s = s - s.mean(dim=1, keepdim=True)
++    s = s / s.amax(dim=1, keepdim=True).clamp_min(1e-12)
++    return s.masked_fill(mask, 0.0)
++
++
++def shuffle_tokens(v, x):
++    """[B, N] values permuted over the N current tokens, seeded per clip from its content."""
++    out = torch.empty_like(v)
++    for b in range(v.shape[0]):
++        seed = int((x[b, :4, :4].float().abs().sum().item() * 1e4)) % (2 ** 31)
++        gen = torch.Generator(device="cpu").manual_seed(seed)
++        out[b] = v[b, torch.randperm(v.shape[1], generator=gen).to(v.device)]
++    return out
++
++
++def set_external_relevance(rel):
++    global EXTERNAL_RELEVANCE
++    EXTERNAL_RELEVANCE = rel
++
++
++# Learned matching embedding (bsm_match_metric="learned", direction B): a module mapping the
++# current hidden tokens [B, N, D] to matching features [B, N, d]; replaces the Key cosine.
++MATCHER = None
++
++
++def set_matcher(module):
++    global MATCHER
++    MATCHER = module
++
++
++# Learned relevance scorer (relevance_source="scorer"): a module mapping the dense hidden
++# tokens at the first merge layer [B, N, D] to per-token scores [B, N].
++SCORER = None
++
++
++def set_scorer(module):
++    global SCORER
++    SCORER = module
+ 
+ 
+ class DiagnosticTokenMerger(LocalTokenMerger):
+@@ -58,6 +108,82 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+     # layers > L_start are handled natively. Reached only from
+     # LocalTokenMerger.forward's bsm dispatch (subclass-only strategy).
+     # ------------------------------------------------------------------
++    @staticmethod
++    def _capacity_select(scores, r, size_a, size_b, cap_count, cap_abs, max_rounds=16):
++        """Capacity-constrained K-BSM edge selection (balanced group sizes).
++
++        Same similarity rule as K-BSM: every source proposes to its most similar receiver and
++        edges are accepted greedily in descending similarity. An edge is rejected when its
++        receiver would exceed cap_count sources in this layer or cap_abs total size; a rejected
++        source re-proposes to its best NON-full receiver in the next round. Exactly r edges
++        per sample are returned; if the caps cannot be met (rare), the remaining slots are
++        filled with the best unconstrained edges and counted in cap_forced.
++        With no binding cap this selects the same edge set as top-r (up to exact score ties).
++        """
++        B, Na, Nb = scores.shape
++        dev = scores.device
++        ninf = float("-inf")
++        chosen = torch.zeros(B, Na, dtype=torch.bool, device=dev)
++        dest = torch.zeros(B, Na, dtype=torch.long, device=dev)
++        load = torch.zeros(B, Nb, device=dev)
++        mass = size_b.clone()
++        need = torch.full((B,), int(r), dtype=torch.long, device=dev)
++        pos = torch.arange(Na, device=dev).expand(B, -1)
++        rounds = 0
++        for rounds in range(1, max_rounds + 1):
++            s = scores.float().masked_fill(chosen.unsqueeze(-1), ninf)
++            if cap_count > 0:
++                s = s.masked_fill((load >= cap_count).unsqueeze(1), ninf)
++            if cap_abs > 0.0:
++                s = s.masked_fill(mass.unsqueeze(1) + size_a.unsqueeze(-1) > cap_abs, ninf)
++            bs, bb = s.max(dim=2)                                           # [B, Na]
++            order = bs.argsort(dim=1, descending=True, stable=True)        # score order
++            valid = torch.isfinite(bs.gather(1, order))
++            recv = torch.where(valid, bb.gather(1, order), torch.full_like(order, Nb))
++            w = size_a.gather(1, order) * valid
++            # per-receiver running count / size in score order (segmented cumsum)
++            perm = recv.argsort(dim=1, stable=True)
++            key = recv.gather(1, perm)
++            one = valid.gather(1, perm).float()
++            ww = w.gather(1, perm)
++            c1, cw = one.cumsum(1), ww.cumsum(1)
++            start = torch.ones_like(key, dtype=torch.bool)
++            start[:, 1:] = key[:, 1:] != key[:, :-1]
++            sidx = torch.where(start, pos, torch.zeros_like(pos)).cummax(1).values
++            occ = c1 - (c1 - one).gather(1, sidx)
++            wsum = cw - (cw - ww).gather(1, sidx)
++            kc = key.clamp(max=Nb - 1)
++            ok_p = one > 0
++            if cap_count > 0:
++                ok_p &= load.gather(1, kc) + occ <= cap_count
++            if cap_abs > 0.0:
++                ok_p &= mass.gather(1, kc) + wsum <= cap_abs
++            ok = torch.zeros_like(ok_p).scatter_(1, perm, ok_p)           # back to score order
++            take_o = ok & (ok.long().cumsum(1) <= need.unsqueeze(1))
++            take = torch.zeros_like(take_o).scatter_(1, order, take_o)    # A-local
++            chosen |= take
++            dest = torch.where(take, bb, dest)
++            tb = bb.masked_fill(~take, 0)
++            load.scatter_add_(1, tb, take.float())
++            mass.scatter_add_(1, tb, size_a * take)
++            need = need - take.sum(1)
++            if int(need.max()) == 0:
++                break
++        forced = int(need.sum())
++        if forced > 0:        # caps infeasible: fill with the best remaining unconstrained edges
++            s = scores.float().masked_fill(chosen.unsqueeze(-1), ninf)
++            bs, bb = s.max(dim=2)
++            order = bs.argsort(dim=1, descending=True, stable=True)
++            take_o = pos < need.unsqueeze(1)
++            take = torch.zeros_like(take_o).scatter_(1, order, take_o)
++            chosen |= take
++            dest = torch.where(take, bb, dest)
++        # deterministic ascending source order
++        edge_a = torch.where(chosen, Na - pos, torch.zeros_like(pos)).topk(int(r), dim=1).values
++        edge_a = Na - edge_a
++        edge_b = dest.gather(1, edge_a)
++        return edge_a, edge_b, dict(cap_rounds=rounds, cap_forced=forced)
++
+     @torch.no_grad()
+     def _forward_bsm(self, x, token_ids, token_size, rep_for_orig, t_grid, h_grid, w_grid, attn_key):
+         batch_size, num_tokens, dim = x.shape
+@@ -67,6 +193,10 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         # always has a partner for every kept A-token and >=1 token survives.
+         ratio = max(0.0, min(self.config.merge_ratio, 0.25))
+         r = int(math.floor(num_tokens * ratio))
++        counts = tuple(getattr(self.config, "merge_counts", ()) or ())
++        if counts:                                   # round N: explicit per layer counts (vid-TLDR style schedule)
++            layers = [int(j) for j in self.config.merge_layers]
++            r = int(counts[layers.index(int(getattr(self, "_block_index", layers[0])))])
+         r = min(r, (num_tokens - 1) // 2)
+         if r <= 0 or num_tokens < 2:
+             return x, token_ids, token_size, rep_for_orig, self._info(
+@@ -75,8 +205,24 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+             )
+ 
+         # -- Matching metric (UNCHANGED from K-BSM) --------------------------
+-        want_key = str(getattr(self.config, "bsm_match_metric", "key")) == "key"
+-        if (
++        want_key = str(getattr(self.config, "bsm_match_metric", "key")) in ("key", "key_prerope")
++        if str(getattr(self.config, "bsm_match_metric", "key")) == "learned":
++            if MATCHER is None:
++                raise RuntimeError("bsm_match_metric='learned' but no matcher was set")
++            # per-layer matchers (B2): a list indexed by the merge call within this forward;
++            # the first call of a forward is recognised by the still-dense token set.
++            if num_tokens == rep_for_orig.shape[1]:
++                self._merge_call = 0
++            else:
++                self._merge_call = getattr(self, "_merge_call", 0) + 1
++            mod = MATCHER
++            if isinstance(MATCHER, (list, tuple)):
++                mod = MATCHER[min(self._merge_call, len(MATCHER) - 1)]
++            with torch.autocast("cuda", enabled=False):
++                metric_src = mod(x.float()).float()
++            match_metric = "learned"
++            fallback_reason = None
++        elif (
+             want_key
+             and attn_key is not None
+             and attn_key.dim() == 3
+@@ -84,7 +230,7 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+             and attn_key.shape[1] == num_tokens
+         ):
+             metric_src = attn_key.float()
+-            match_metric = "key"
++            match_metric = str(getattr(self.config, "bsm_match_metric", "key"))
+             fallback_reason = None
+         else:
+             metric_src = x.float()
+@@ -109,7 +255,51 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         # also surface a per-A "energy" tensor for info/debug (None for K-BSM).
+         use_pitome = (self.config.strategy == "bsm_pitome_gradual_vec")
+         partition_mode = str(getattr(self.config, "bsm_partition", "positional"))
+-        if use_pitome:
++        taware = self.config.strategy == "bsm_taware_gradual_vec"
++        part_mode = str(getattr(self.config, "relevance_partition", "none")) if taware else "none"
++        rel_part = part_mode in ("recv", "excl")
++        rel_anchor = float(getattr(self.config, "relevance_anchor", 0.0)) if taware else 0.0
++        lam_cfg = float(getattr(self.config, "relevance_lambda", 1.0)) if taware else 0.0
++        rel_cur = None
++        if taware and (lam_cfg > 0.0 or rel_part or rel_anchor > 0.0 or part_mode == "seg"):
++            rel_cur = self._wam_relevance(x, token_ids, rep_for_orig,
++                                          int(t_grid), int(h_grid), int(w_grid))  # [B,N] in [0,1]
++        a_valid_pad = None   # [B, Na] validity of padded per-sample A rows (recv partition)
++        b_valid_pad = None   # [B, Nb]
++        if rel_part:
++            # Even/odd split, except that relevant tokens (rel > 0.5) are moved from A to B:
++            # they can still absorb similar neighbours but are never removed. Per-sample
++            # counts differ, so indices are padded and padded rows/columns are masked.
++            # "excl" removes relevant tokens from both sides: they pass through untouched
++            # and the remaining tokens are matched among themselves (masked re-matching).
++            pos = torch.arange(num_tokens, device=x.device)
++            # protect at most relevance_quota of the CURRENT tokens (highest relevance first,
++            # only tokens with relevance > 0), so the scheduled budget stays reachable.
++            n_prot = int(math.floor(float(self.config.relevance_quota) * num_tokens))
++            prot = torch.zeros_like(rel_cur, dtype=torch.bool)
++            if n_prot > 0:
++                prot.scatter_(1, rel_cur.topk(n_prot, dim=1).indices, True)
++                prot &= rel_cur > 0
++            even = (pos.remainder(2) == 0).unsqueeze(0)
++            in_a = even & ~prot                                                  # [B, N]
++            in_b = ~in_a if part_mode == "recv" else (~even & ~prot)
++            cnt_a, cnt_b = in_a.sum(1), in_b.sum(1)
++            order_a = torch.argsort((~in_a).to(torch.int8), dim=1, stable=True)  # A first, by position
++            order_b = torch.argsort((~in_b).to(torch.int8), dim=1, stable=True)  # B first, by position
++            na_max = int(cnt_a.max().item())
++            nb_max = max(1, int(cnt_b.max().item()))
++            a_idx = order_a[:, :na_max].contiguous()
++            b_idx = order_b[:, :nb_max].contiguous()
++            ar = torch.arange(na_max, device=x.device).unsqueeze(0)
++            br = torch.arange(nb_max, device=x.device).unsqueeze(0)
++            a_valid_pad = ar < cnt_a.unsqueeze(1)
++            b_valid_pad = br < cnt_b.unsqueeze(1)
++            energy_a = None
++            partition_name = f"relevance_{part_mode}"
++        elif use_pitome and bool(getattr(self.config, "pitome_official", False)):
++            a_idx, b_idx, energy_a = self._pitome_official_partition(metric, r)
++            partition_name = "pitome_official"
++        elif use_pitome:
+             a_idx, b_idx, energy_a = self._bsm_energy_partition(metric, num_tokens)
+             partition_name = "energy"
+         else:
+@@ -122,8 +312,8 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+             energy_a = None
+             partition_name = "positional" if partition_mode != "temporal" else "positional_from_temporal_req"
+ 
+-        na = a_idx.numel()
+-        nb = b_idx.numel()
++        na = a_idx.shape[-1]
++        nb = b_idx.shape[-1]
+         # r cannot exceed #A-tokens (each A contributes <=1 edge).
+         r = min(r, na)
+         if r <= 0 or nb == 0:
+@@ -150,6 +340,47 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+             a_metric = metric.index_select(1, a_idx)   # [B, Na, d]
+             b_metric = metric.index_select(1, b_idx)   # [B, Nb, d]
+         scores = torch.bmm(a_metric, b_metric.transpose(1, 2))   # [B, Na, Nb] cosine
++        _mm = str(getattr(self.config, "bsm_match_metric", "key"))
++        self._report_cos = None
++        if _mm in ("position", "random") and attn_key is not None and attn_key.shape[:2] == (batch_size, num_tokens):
++            # diagnostics only: the key cosine of every candidate pair, to report what these baselines merge
++            km = F.normalize(torch.nan_to_num(attn_key.float()), dim=-1, eps=1e-6)
++            if a_idx.dim() == 2:
++                ka = km.gather(1, a_idx.unsqueeze(-1).expand(-1, -1, km.shape[-1])); kb = km.gather(1, b_idx.unsqueeze(-1).expand(-1, -1, km.shape[-1]))
++            else:
++                ka = km.index_select(1, a_idx); kb = km.index_select(1, b_idx)
++            self._report_cos = torch.bmm(ka, kb.transpose(1, 2))
++        if _mm in ("position", "random"):
++            # content free baselines (round B). position: partner = the spatiotemporally nearest current token
++            # (negative squared distance between the mean cells each token covers), so merging pools neighbours
++            # as a uniform pooling would; random: uniform random scores, seeded per clip from its content.
++            if _mm == "position":
++                nd = rep_for_orig.shape[1]
++                o = torch.arange(nd, device=x.device)
++                hw = int(h_grid) * int(w_grid)
++                cells = torch.stack([o // hw, (o % hw) // int(w_grid), o % int(w_grid)], -1).float()   # [nd,3]
++                slot = torch.full((batch_size, nd), -1, dtype=torch.long, device=x.device)
++                slot.scatter_(1, token_ids, torch.arange(num_tokens, device=x.device).expand(batch_size, -1))
++                cur = slot.gather(1, rep_for_orig)                                                     # [B,nd]
++                csum = torch.zeros(batch_size, num_tokens, 3, device=x.device)
++                csum.scatter_add_(1, cur.unsqueeze(-1).expand(-1, -1, 3), cells.expand(batch_size, -1, -1))
++                cnt = torch.zeros(batch_size, num_tokens, device=x.device)
++                cnt.scatter_add_(1, cur, torch.ones_like(cur, dtype=torch.float))
++                cen = csum / cnt.clamp_min(1).unsqueeze(-1)
++                if a_idx.dim() == 2:
++                    ca = cen.gather(1, a_idx.unsqueeze(-1).expand(-1, -1, 3)); cb = cen.gather(1, b_idx.unsqueeze(-1).expand(-1, -1, 3))
++                else:
++                    ca = cen.index_select(1, a_idx); cb = cen.index_select(1, b_idx)
++                scores = -torch.cdist(ca, cb).pow(2)
++            else:
++                scores = torch.empty_like(scores)
++                for b in range(batch_size):
++                    seed = int((x[b, :4, :4].float().abs().sum().item() * 1e4)) % (2 ** 31)
++                    gen = torch.Generator(device=x.device).manual_seed(seed)
++                    scores[b] = torch.rand(scores.shape[1:], generator=gen, device=x.device)
++        if a_valid_pad is not None:
++            scores = scores.masked_fill(~b_valid_pad.unsqueeze(1), float("-inf"))
++            scores = scores.masked_fill(~a_valid_pad.unsqueeze(2), float("-inf"))
+ 
+         # -- Axis constraint mask (NEW) --------------------------------------
+         # Applied AFTER scores, BEFORE the per-A argmax. Frames come from the
+@@ -161,6 +392,18 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+                 scores, token_ids, a_idx, b_idx, int(h_grid), int(w_grid), axis
+             )
+ 
++        # ninth review, round SEG: relevant (> 0.5) and other tokens may not merge with each other; the partition and
++        # the K-BSM order are otherwise unchanged. A-rows left without an allowed partner are kept out of the top-r.
++        if part_mode == "seg" and rel_cur is not None:
++            hot = rel_cur > 0.5
++            if a_idx.dim() == 2:
++                ha, hb = hot.gather(1, a_idx), hot.gather(1, b_idx)
++            else:
++                ha, hb = hot.index_select(1, a_idx), hot.index_select(1, b_idx)
++            scores = scores.masked_fill(ha.unsqueeze(2) != hb.unsqueeze(1), float("-inf"))
++            seg_valid = torch.isfinite(scores).any(dim=2)
++            a_valid_row = seg_valid if a_valid_row is None else (a_valid_row & seg_valid)
++
+         # each A-token -> most similar ALLOWED B-token
+         best_sim, best_b_local = scores.max(dim=2)   # [B, Na], [B, Na]
+ 
+@@ -170,6 +413,8 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         # bottom, topk will only pick a masked row if there are fewer than r rows
+         # with a finite edge. So we cap r at the per-sample count of valid rows
+         # (min over the batch keeps r a single scalar -> rectangular [B,N-r,D]).
++        if a_valid_pad is not None:
++            a_valid_row = a_valid_pad if a_valid_row is None else (a_valid_row & a_valid_pad)
+         if a_valid_row is not None:
+             valid_rows_per_sample = a_valid_row.sum(dim=1)            # [B]
+             r_eff = int(min(int(r), int(valid_rows_per_sample.min().item())))
+@@ -196,31 +441,79 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         rank_score = best_sim
+         rel_source_used = None
+         if self.config.strategy == "bsm_taware_gradual_vec":
+-            lam = float(getattr(self.config, "relevance_lambda", 1.0))
++            lam = lam_cfg
++            if rel_cur is not None:
++                rel_source_used = str(getattr(self.config, "relevance_source", "motion") or "motion")
+             if lam > 0.0:
+-                rel = self._wam_relevance(x, token_ids, rep_for_orig,
+-                                          int(t_grid), int(h_grid), int(w_grid))  # [B,N] in [0,1]
++                rel = rel_cur
+                 rel_source_used = str(getattr(self.config, "relevance_source", "motion") or "motion")
+                 pw = float(getattr(self.config, "relevance_power", 1.0))
+-                gate = (1.0 - lam * rel).clamp(0.0, 1.0).pow(pw)        # [B, N]
+-                if a_idx.dim() == 2:
+-                    gate_a = gate.gather(1, a_idx)                      # [B, Na]
+-                    gate_b_all = gate.gather(1, b_idx)                  # [B, Nb]
++                gate_form = str(getattr(self.config, "relevance_gate", "mult"))
++
++                def _ab(t):   # per-current-token tensor -> (A rows, chosen B of each A row)
++                    if a_idx.dim() == 2:
++                        ta, tb = t.gather(1, a_idx), t.gather(1, b_idx)
++                    else:
++                        ta, tb = t.index_select(1, a_idx), t.index_select(1, b_idx)
++                    return ta, tb.gather(1, best_b_local)
++
++                if gate_form == "quota":
++                    # hard protection: the top-q fraction of CURRENT tokens by relevance
++                    # (ties broken by position) can neither be merged away nor absorb.
++                    n_prot = int(math.floor(float(self.config.relevance_quota) * num_tokens))
++                    prot = torch.zeros_like(rel, dtype=torch.bool)
++                    if n_prot > 0:
++                        prot.scatter_(1, rel.topk(n_prot, dim=1).indices, True)
++                    pa, pb = _ab(prot)
++                    blocked = pa | pb
++                    rank_score = best_sim.masked_fill(blocked, float("-inf"))
++                    r = int(min(int(r), int((~blocked & torch.isfinite(best_sim)).sum(1).min().item())))
++                    if r <= 0:
++                        info = self._info(x, x, 0, 0, selected_scores=None,
++                                          implementation="vectorized_bsm", num_accepted=0)
++                        info["relevance_gate"] = gate_form
++                        return x, token_ids, token_size, rep_for_orig, info
++                elif gate_form == "add":
++                    ra, rb = _ab(rel)
++                    beta = float(getattr(self.config, "relevance_beta", 1.0))
++                    rank_score = torch.where(torch.isfinite(best_sim),
++                                             best_sim - beta * lam * (ra + rb), best_sim)
+                 else:
+-                    gate_a = gate.index_select(1, a_idx)               # [B, Na]
+-                    gate_b_all = gate.index_select(1, b_idx)           # [B, Nb]
+-                gate_b_chosen = gate_b_all.gather(1, best_b_local)    # [B, Na]
+-                gated = best_sim * gate_a * gate_b_chosen
+-                # keep axis-masked (-inf) rows at -inf (avoid -inf*0=nan promotion)
+-                rank_score = torch.where(torch.isfinite(best_sim), gated, best_sim)
++                    gate = (1.0 - lam * rel).clamp(0.0, 1.0).pow(pw)    # [B, N]
++                    gate_a, gate_b_chosen = _ab(gate)
++                    sim = (1.0 + best_sim) * 0.5 if gate_form == "signsafe" else best_sim
++                    if gate_form == "source":
++                        gated = sim * gate_a
++                    else:
++                        gated = sim * gate_a * gate_b_chosen
++                    # keep axis-masked (-inf) rows at -inf (avoid -inf*0=nan promotion)
++                    rank_score = torch.where(torch.isfinite(best_sim), gated, best_sim)
+ 
+         # keep the r strongest A->B edges per sample (top-r by rank_score). r is a
+         # single scalar across the batch -> exactly r sources dropped per sample
+         # -> x_new stays a dense [B, N-r, D] (the invariant A/B/C rely on). Every
+         # selected edge is finite because r <= #valid rows.
+-        _, edge_a_local = rank_score.topk(r, dim=1)             # [B, r]
+-        edge_b_local = best_b_local.gather(1, edge_a_local)     # [B, r]
+-        edge_sim = best_sim.gather(1, edge_a_local)             # [B, r] ACTUAL cosine
++        cap_count = int(getattr(self.config, "bsm_cap_count", 0))
++        cap_size = float(getattr(self.config, "bsm_cap_size", 0.0))
++        cap_info = None
++        if cap_count > 0 or cap_size > 0.0:
++            if rank_score is not best_sim:
++                raise NotImplementedError("bsm_cap_* is defined for the plain K-BSM order only")
++            if a_idx.dim() == 2:
++                size_a, size_b = token_size.gather(1, a_idx), token_size.gather(1, b_idx)
++            else:
++                size_a, size_b = token_size.index_select(1, a_idx), token_size.index_select(1, b_idx)
++            cap_abs = cap_size * rep_for_orig.shape[1] / float(num_tokens - r) if cap_size > 0.0 else 0.0
++            edge_a_local, edge_b_local, cap_info = self._capacity_select(
++                scores, r, size_a.float(), size_b.float(), cap_count, cap_abs)
++            edge_sim = scores.gather(2, edge_b_local.unsqueeze(-1)).squeeze(-1)
++        else:
++            _, edge_a_local = rank_score.topk(r, dim=1)             # [B, r]
++            edge_b_local = best_b_local.gather(1, edge_a_local)     # [B, r]
++            edge_sim = best_sim.gather(1, edge_a_local)             # [B, r] ACTUAL cosine
++            if getattr(self, "_report_cos", None) is not None:      # content free baselines: report the key cosine
++                rc = self._report_cos.gather(1, edge_a_local.unsqueeze(-1).expand(-1, -1, self._report_cos.shape[-1]))
++                edge_sim = rc.gather(2, edge_b_local.unsqueeze(-1)).squeeze(-1)
+ 
+         # map A/B local indices back to ABSOLUTE token positions (per-sample or
+         # shared, mirroring the a_idx/b_idx shape handled above).
+@@ -252,17 +545,45 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         receiver_ids = token_ids.gather(1, receiver_pos)        # [B, r]
+         source_weight = size_f.gather(1, source_pos)            # [B, r] fp32
+         source_x = x_f.gather(1, source_pos.unsqueeze(-1).expand(-1, -1, dim))  # [B, r, D] fp32
+-        weighted_src = source_x * source_weight.unsqueeze(-1)   # [B, r, D] fp32
++        if rel_anchor > 0.0:
++            # anchored averaging: relevant members dominate the merged feature;
++            # token sizes (used by proportional attention) still count original tokens.
++            feat_w = size_f * (1.0 + rel_anchor * rel_cur.float())
++        else:
++            feat_w = size_f
++        src_feat_w = feat_w.gather(1, source_pos)
++        if str(getattr(self.config, "saliency_weight", "none")) == "drop":
++            # round B: drop the merged sources instead of averaging them (pruning); sizes are not added
++            src_feat_w = src_feat_w * 0.0
++            source_weight = source_weight * 0.0
++        elif str(getattr(self.config, "saliency_weight", "none")) in ("vidtldr", "vidtldr_shuffle"):
++            # vid-TLDR (round T): each merged SOURCE is weighted by its saliency (0 for background), in its
++            # feature contribution and in the size it adds to the receiver, as vid-TLDR merging / merge_wavg.
++            ent = getattr(self, "_attn_entropy", None)
++            if ent is None or tuple(ent.shape) != (batch_size, num_tokens):
++                raise RuntimeError("saliency_weight=vidtldr but no attention entropy was stashed for this layer")
++            so_all = vidtldr_objective(ent.float())
++            if str(self.config.saliency_weight) == "vidtldr_shuffle":
++                # round SS: the same saliency values at permuted positions among the current tokens, seeded per
++                # clip from its own content (as _transform_relevance), so the value distribution is unchanged
++                so_all = shuffle_tokens(so_all, x)
++            so_src = so_all.gather(1, source_pos)
++            src_feat_w = src_feat_w * so_src
++            source_weight = source_weight * so_src
++        weighted_src = source_x * src_feat_w.unsqueeze(-1)      # [B, r, D] fp32
+ 
+         acc_x = torch.zeros_like(x_f)
+         acc_w = torch.zeros_like(size_f)
++        acc_fw = torch.zeros_like(size_f)
+         acc_x.scatter_add_(1, receiver_pos.unsqueeze(-1).expand(-1, -1, dim), weighted_src)
+         acc_w.scatter_add_(1, receiver_pos, source_weight)
++        acc_fw.scatter_add_(1, receiver_pos, src_feat_w)
+         recv_mask = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.bool)
+         recv_mask.scatter_(1, receiver_pos, True)
+         old_w = size_f                                           # [B, N] fp32
+         new_w = old_w + acc_w
+-        merged_x = (x_f * old_w.unsqueeze(-1) + acc_x) / new_w.clamp_min(1e-6).unsqueeze(-1)
++        new_fw = feat_w + acc_fw
++        merged_x = (x_f * feat_w.unsqueeze(-1) + acc_x) / new_fw.clamp_min(1e-6).unsqueeze(-1)
+         # guard against any residual non-finite (e.g. a non-finite incoming x row)
+         merged_x = torch.nan_to_num(merged_x, nan=0.0, posinf=0.0, neginf=0.0)
+         x_updated = torch.where(recv_mask.unsqueeze(-1), merged_x.to(x.dtype), x)
+@@ -272,9 +593,27 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         keep = torch.ones(batch_size, num_tokens, device=x.device, dtype=torch.bool)
+         keep.scatter_(1, source_pos, False)
+         num_after = num_tokens - r
+-        x_new = x_updated[keep].reshape(batch_size, num_after, dim)
+-        ids_new = token_ids[keep].reshape(batch_size, num_after)
+-        size_new = token_size_updated[keep].reshape(batch_size, num_after)
++        if LEAN:   # round FUSE: the same survivors in the same order, gathered without a host synchronisation
++            kidx = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)[:, :num_after]
++            x_new = x_updated.gather(1, kidx.unsqueeze(-1).expand(-1, -1, dim))
++            ids_new = token_ids.gather(1, kidx)
++            size_new = token_size_updated.gather(1, kidx)
++        else:
++            x_new = x_updated[keep].reshape(batch_size, num_after, dim)
++            ids_new = token_ids[keep].reshape(batch_size, num_after)
++            size_new = token_size_updated[keep].reshape(batch_size, num_after)
++        if str(getattr(self.config, "merge_order", "keep")) == "official":
++            # round N: vid-TLDR returns cat([unmerged sources, receivers]), each in its original order
++            is_a = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.bool)
++            if a_idx.dim() == 2:
++                is_a.scatter_(1, a_idx, True)
++            else:
++                is_a[:, a_idx] = True
++            surv_a = is_a[keep].reshape(batch_size, num_after)
++            order = torch.argsort((~surv_a).to(torch.int8), dim=1, stable=True)
++            x_new = x_new.gather(1, order.unsqueeze(-1).expand(-1, -1, dim))
++            ids_new = ids_new.gather(1, order)
++            size_new = size_new.gather(1, order)
+ 
+         # -- Multi-layer rep_for_orig carry-forward (UNCHANGED) --------------
+         num_original_tokens = rep_for_orig.shape[1]
+@@ -295,6 +634,13 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+             num_candidate_cells=int(batch_size * na),
+             num_accepted=r,
+         )
++        if LEAN:
++            return x_new, ids_new, size_new, rep_new, info
++        info["neg_sim_selected_frac"] = float((edge_sim < 0).float().mean().item())
++        if cap_info is not None:
++            info.update(cap_info)
++        if rel_source_used is not None:
++            info["relevance_gate"] = str(getattr(self.config, "relevance_gate", "mult"))
+         info["bsm_match_metric"] = match_metric
+         info["matching_metric"] = match_metric
+         info["bsm_partition"] = partition_name
+@@ -312,6 +658,26 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+             info["fallback_reason"] = fallback_reason
+         return x_new, ids_new, size_new, rep_new, info
+ 
++    @torch.no_grad()
++    def _pitome_official_partition(self, metric, r):
++        """Published PiToMe (official vision code, pitome()): energy E_i = mean_j ELU(cos_ij - m) over
++        all tokens (self included) with margin m = 0.75 (1 - l / L) for block l of L; the 2r tokens of
++        highest energy are mergeable and split alternately into sources A and receivers B (r each);
++        every A token merges into its most similar B token (the caller's top-r over r rows keeps all);
++        every other token is protected. Returns per-sample [B, r] index tensors."""
++        li = int(getattr(self, "_block_index", 0))
++        nl = int(getattr(self, "_num_blocks", 1))
++        margin = 0.75 - 0.75 * (li / max(1, nl))
++        sim = torch.bmm(metric, metric.transpose(1, 2))                    # [B, N, N] cosine
++        energy = F.elu(sim - margin, alpha=1.0).mean(dim=2)                # [B, N]
++        del sim
++        energy = torch.nan_to_num(energy, nan=-1.0e4, posinf=1.0e4, neginf=-1.0e4)
++        order = torch.argsort(energy, dim=1, descending=True, stable=True)
++        a_idx = order[:, 0:2 * r:2].contiguous()
++        b_idx = order[:, 1:2 * r:2].contiguous()
++        self._last_pitome_margin = margin
++        return a_idx, b_idx, energy.gather(1, a_idx)
++
+     # ---------------------------------------------------------------------
+     # NEW HELPER 1 — PiToMe energy partition.
+     # ---------------------------------------------------------------------
+@@ -516,6 +882,29 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         except Exception:
+             return None
+ 
++    @torch.no_grad()
++    def _transform_relevance(self, rel, x, t_grid, hw):
++        """Priority-signal controls on the dense motion or external (hand) score [B, t*h*w]; seeded per clip from its own
++        content (as random_inplace), so they do not depend on batching. none -> unchanged."""
++        mode = str(getattr(self.config, "relevance_transform", "none"))
++        if mode == "none":
++            return rel
++        rel = rel.float().clone()
++        if mode == "invert":
++            return rel.amax(dim=1, keepdim=True) - rel
++        out = torch.empty_like(rel)
++        for b in range(rel.shape[0]):
++            seed = int((x[b, :4, :4].float().abs().sum().item() * 1e4)) % (2 ** 31)
++            gen = torch.Generator(device="cpu").manual_seed(seed)
++            if mode == "shuffle":
++                perm = torch.randperm(rel.shape[1], generator=gen).to(rel.device)
++                out[b] = rel[b, perm]
++            else:                                   # shuffle_frame
++                g = rel[b].reshape(t_grid, hw)
++                perm = torch.stack([torch.randperm(hw, generator=gen) for _ in range(t_grid)]).to(rel.device)
++                out[b] = g.gather(1, perm).reshape(-1)
++        return out
++
+     @torch.no_grad()
+     def _wam_relevance(self, x, token_ids, rep_for_orig, t_grid, h_grid, w_grid):
+         """Per-CURRENT-token task relevance in [0,1] (1 = protect hardest).
+@@ -536,11 +925,36 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         if source == "none":
+             source = "motion"
+ 
++        norm_mode = str(getattr(self.config, "relevance_norm", "max"))
++        prop_mode = str(getattr(self.config, "relevance_prop", "self"))
++
+         def _unit01(rel):
++            if norm_mode == "rank":
++                # per-sample rank in [0,1] over the CURRENT tokens (mean 0.5 at every
++                # layer, so the total suppressed priority no longer depends on how
++                # sparse the signal is); ties broken by position for determinism.
++                n = rel.shape[1]
++                order = rel.float().argsort(dim=1, stable=True)
++                ranks = torch.empty_like(order)
++                ranks.scatter_(1, order, torch.arange(n, device=rel.device).expand_as(order))
++                return ranks.float() / max(n - 1, 1)
+             rel = rel.float().clamp_min(0.0)
+             rel = rel / rel.amax(dim=1, keepdim=True).clamp_min(1e-6)
+             return rel
+ 
++        def _shape_motion(rel):
++            """M3 first-frame fill and E1 per-frame median compensation on the dense grid."""
++            ff = str(getattr(self.config, "relevance_first_frame", "zero"))
++            comp = str(getattr(self.config, "relevance_comp", "none"))
++            if ff == "zero" and comp == "none":
++                return rel
++            g = rel.float().reshape(batch_size, int(t_grid), int(h_grid) * int(w_grid)).clone()
++            if ff == "ffill" and int(t_grid) > 1:
++                g[:, 0] = g[:, 1]
++            if comp == "median":
++                g = (g - g.median(dim=2, keepdim=True).values).clamp_min(0.0)
++            return g.reshape(batch_size, -1)
++
+         # First merge layer: dense grid -> compute & cache (token_ids == arange,
+         # so the per-current-token vector IS indexed by original id).
+         if num_tokens == num_original and num_tokens == int(t_grid * h_grid * w_grid):
+@@ -566,6 +980,33 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+                 rel = compute_importance(x, int(t_grid), int(h_grid), int(w_grid),
+                                          "motion" if source not in ("norm", "norm_motion",
+                                                                     "qk_global_hidden") else source)
++            if source == "external":
++                ext = EXTERNAL_RELEVANCE
++                if ext is None or tuple(ext.shape) != (batch_size, num_tokens):
++                    raise RuntimeError("relevance_source='external' but no matching "
++                                       "EXTERNAL_RELEVANCE was set for this batch")
++                rel = ext.to(device=x.device, dtype=torch.float32)
++                self._wam_rel_actual_source = "external"
++                # shuffled hand controls (round HS): same mask values at permuted positions; none -> unchanged
++                rel = self._transform_relevance(rel, x, int(t_grid), int(h_grid) * int(w_grid))
++            if source == "scorer":
++                if SCORER is None:
++                    raise RuntimeError("relevance_source='scorer' but no scorer was set")
++                with torch.autocast("cuda", enabled=False):
++                    rel = torch.sigmoid(SCORER(x.float())).float()
++                self._wam_rel_actual_source = "scorer"
++            if source == "random_inplace":
++                # control gate with the SAME marginal distribution under rank norm; seeded
++                # per clip from its own content so it is independent of batching.
++                rel = torch.empty(batch_size, num_tokens, device=x.device, dtype=torch.float32)
++                for b in range(batch_size):
++                    seed = int((x[b, :4, :4].float().abs().sum().item() * 1e4)) % (2 ** 31)
++                    gen = torch.Generator(device=x.device).manual_seed(seed)
++                    rel[b] = torch.rand(num_tokens, generator=gen, device=x.device)
++                self._wam_rel_actual_source = "random_inplace"
++            elif self._wam_rel_actual_source == "motion":
++                rel = _shape_motion(rel)
++                rel = self._transform_relevance(rel, x, int(t_grid), int(h_grid) * int(w_grid))
+             if rel is None:
+                 rel = torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
+             self._wam_rel_orig = rel.detach().float()              # [B, num_original]
+@@ -575,6 +1016,14 @@ class DiagnosticTokenMerger(LocalTokenMerger):
+         cache = getattr(self, "_wam_rel_orig", None)
+         if (cache is not None and cache.shape[0] == batch_size
+                 and cache.shape[1] == num_original):
+-            return _unit01(cache.gather(1, token_ids))
++            if prop_mode == "self":
++                return _unit01(cache.gather(1, token_ids))
++            # M4: aggregate over the original tokens each current token represents.
++            # rep_for_orig[b, o] = original id of the current token representing o.
++            agg = torch.zeros_like(cache)
++            agg.scatter_reduce_(1, rep_for_orig, cache,
++                                reduce="amax" if prop_mode == "max" else "mean",
++                                include_self=False)
++            return _unit01(agg.gather(1, token_ids))
+         # Fallback: no cache (first merge layer wasn't dense) -> no protection.
+         return torch.zeros(batch_size, num_tokens, device=x.device, dtype=torch.float32)
+diff --git a/vjepa2/src/models/vision_transformer.py b/vjepa2/src/models/vision_transformer.py
+index 01367c1..861438e 100644
+--- a/vjepa2/src/models/vision_transformer.py
++++ b/vjepa2/src/models/vision_transformer.py
+@@ -274,14 +274,20 @@ class VisionTransformer(nn.Module):
+             merge_enabled
+             and getattr(self.merge_config, "strategy", "")
+             in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec")
+-            and getattr(self.merge_config, "bsm_match_metric", "key") == "key"
++            and (getattr(self.merge_config, "bsm_match_metric", "key") in ("key", "key_prerope")
++                 or (__import__("os").environ.get("WAM_REPORT_KEYS") == "1"      # diagnostics only (edge_stats.py)
++                     and getattr(self.merge_config, "bsm_match_metric", "key") in ("position", "random")))
+         )
++        # "key_prerope" = the original ToMe metric: head-mean key BEFORE the rotary embedding
++        stash_mode = "pre" if getattr(self.merge_config, "bsm_match_metric", "key") == "key_prerope" else True
+         if merge_enabled:
+             merge_layer_set = set(int(j) for j in self.merge_config.merge_layers)
+             for j, blk_j in enumerate(self.blocks):
+                 attn_j = getattr(blk_j, "attn", None)
+                 if attn_j is not None:
+-                    attn_j._stash_attn_key = bool(bsm_key_metric and j in merge_layer_set)
++                    attn_j._stash_attn_key = stash_mode if (bsm_key_metric and j in merge_layer_set) else False
++                    attn_j._stash_attn_entropy = (str(getattr(self.merge_config, "saliency_weight", "none")) in ("vidtldr", "vidtldr_shuffle")
++                                                  and j in merge_layer_set)
+ 
+         # Fwd prop
+         outs = []
+@@ -289,6 +295,8 @@ class VisionTransformer(nn.Module):
+         seen_merge = False
+         for i, blk in enumerate(self.blocks):
+             if self.use_activation_checkpointing:
++                if merge_enabled and bool(getattr(self.merge_config, "prop_attn", False)):
++                    raise NotImplementedError("prop_attn is not wired into the activation-checkpointing path")
+                 x = torch.utils.checkpoint.checkpoint(
+                     blk,
+                     x,
+@@ -300,15 +308,51 @@ class VisionTransformer(nn.Module):
+                     use_reentrant=False,
+                 )
+             else:
++                # Optional ToMe proportional attention: after the first merge, every key gets a
++                # log(size) logit bias so a merged group keeps the attention mass of the tokens it
++                # stands for. Off by default (published configs pass attn_mask=None, unchanged).
++                attn_bias = None
++                if merge_enabled and seen_merge and bool(getattr(self.merge_config, "prop_attn", False)):
++                    bdt = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else x.dtype
++                    attn_bias = token_size.float().clamp_min(1.0).log()[:, None, None, :].to(bdt)
++                mid_merge = (merge_enabled and i in self.merge_config.merge_layers
++                             and str(getattr(self.merge_config, "merge_point", "post")) == "mid")
++                mid_state = {}
++                if mid_merge:
++                    def _mid_hook(xm, blk=blk, i=i, mid_state=mid_state):
++                        attn_mod = blk.attn
++                        a_key = getattr(attn_mod, "_stashed_key", None)
++                        attn_mod._stashed_key = None
++                        self.token_merger._attn_entropy = getattr(attn_mod, "_stashed_entropy", None)
++                        attn_mod._stashed_entropy = None
++                        self.token_merger._block_index = i
++                        self.token_merger._num_blocks = len(self.blocks)
++                        mid_state["out"] = self.token_merger(
++                            x=xm, token_ids=token_ids, token_size=token_size, rep_for_orig=rep_for_orig,
++                            t_grid=T, h_grid=H_patches, w_grid=W_patches, attn_key=a_key)
++                        return mid_state["out"][0]
++                    blk._mid_merge = _mid_hook
+                 x = blk(
+                     x,
+                     mask=token_ids if merge_enabled else masks,
+-                    attn_mask=None,
++                    attn_mask=attn_bias,
+                     T=T,
+                     H_patches=H_patches,
+                     W_patches=W_patches,
+                 )
+-            if merge_enabled and i in self.merge_config.merge_layers:
++                if mid_merge:
++                    blk._mid_merge = None
++                    _, token_ids, token_size, rep_for_orig, info = mid_state["out"]
++                    info["layer"] = int(i)
++                    info["original_num_tokens"] = int(original_num_tokens)
++                    info["restore_dense"] = bool(restore_dense)
++                    info["sequence_reduced"] = True
++                    info["merge_point"] = "mid"
++                    merge_infos.append(info)
++                    seen_merge = True
++                    block_segment_start = _profile_now(profile_device, profile_enabled)
++            if (merge_enabled and i in self.merge_config.merge_layers
++                    and str(getattr(self.merge_config, "merge_point", "post")) != "mid"):
+                 block_segment_end = _profile_now(profile_device, profile_enabled)
+                 block_segment_ms = (block_segment_end - block_segment_start) * 1000.0
+                 if seen_merge:
+@@ -324,6 +368,10 @@ class VisionTransformer(nn.Module):
+                 if attn_mod is not None:
+                     attn_key = getattr(attn_mod, "_stashed_key", None)
+                     attn_mod._stashed_key = None  # release reference promptly
++                    self.token_merger._attn_entropy = getattr(attn_mod, "_stashed_entropy", None)   # vid-TLDR only
++                    attn_mod._stashed_entropy = None
++                self.token_merger._block_index = i          # used only by the published PiToMe margin
++                self.token_merger._num_blocks = len(self.blocks)
+                 merge_start = _profile_now(profile_device, profile_enabled)
+                 x, token_ids, token_size, rep_for_orig, info = self.token_merger(
+                     x=x,
+@@ -373,6 +421,9 @@ class VisionTransformer(nn.Module):
+             _profile_now(profile_device, profile_enabled) - norm_start
+         ) * 1000.0
+ 
++        # Expose the final merge state so callers can cache compressed tokens together
++        # with their representative map (read-only; does not change any output).
++        self.last_merge_state = (token_ids, token_size, rep_for_orig) if merge_enabled else None
+         restore_start = _profile_now(profile_device, profile_enabled)
+         if merge_enabled and restore_dense:
+             x = restore_dense_tokens(x, token_ids, rep_for_orig, original_num_tokens)

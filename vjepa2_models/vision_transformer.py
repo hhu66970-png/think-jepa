@@ -1,0 +1,716 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import math
+import time
+from functools import partial
+
+import torch
+import torch.nn as nn
+
+from src.masks.utils import apply_masks
+from src.models.utils.modules import Block
+from src.models.utils.patch_embed import PatchEmbed, PatchEmbed3D
+from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
+from src.models.utils.token_merge import LocalTokenMerger, init_token_merge_state, normalize_merge_config, restore_dense_tokens
+
+
+def _build_token_merger(merge_config):
+    """Pick the merger class for the configured strategy.
+
+    Grid-agnostic diagnostic strategies (currently ``bsm_ksim_gradual_vec``) live
+    only in ``DiagnosticTokenMerger`` and need its ``_forward_bsm``. Every other
+    strategy (A/B/C, the main path) uses the base ``LocalTokenMerger`` so the
+    main training/inference path is byte-identical and never imports diagnostics.
+    """
+    strategy = str(getattr(merge_config, "strategy", ""))
+    if strategy in LocalTokenMerger.VECTORIZED_STRATEGIES:
+        return LocalTokenMerger(merge_config)
+    try:
+        from src.models.utils.token_merge_diagnostics import DiagnosticTokenMerger
+    except Exception:
+        return LocalTokenMerger(merge_config)
+    if strategy in DiagnosticTokenMerger.VECTORIZED_STRATEGIES:
+        return DiagnosticTokenMerger(merge_config)
+    return LocalTokenMerger(merge_config)
+from src.utils.tensors import trunc_normal_
+
+
+def _profile_now(device, enabled):
+    if enabled and device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
+class VisionTransformer(nn.Module):
+    """Vision Transformer"""
+
+    def __init__(
+        self,
+        img_size=(224, 224),
+        patch_size=16,
+        num_frames=1,
+        tubelet_size=2,
+        in_chans=3,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        qk_scale=None,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        norm_layer=nn.LayerNorm,
+        init_std=0.02,
+        out_layers=None,
+        uniform_power=False,
+        use_silu=False,
+        wide_silu=True,
+        use_sdpa=True,
+        use_activation_checkpointing=False,
+        use_rope=False,
+        handle_nonsquare_inputs=True,
+        merge_config=None,
+        **kwargs
+    ):
+        super().__init__()
+        self.num_features = self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.out_layers = out_layers
+        self.handle_nonsquare_inputs = handle_nonsquare_inputs
+
+        if type(img_size) is int:
+            img_size = (img_size, img_size)
+        self.img_height, self.img_width = img_size
+        self.patch_size = patch_size
+        self.num_frames = num_frames
+        self.tubelet_size = tubelet_size
+        self.is_video = num_frames > 1
+        self.merge_config = normalize_merge_config(merge_config)
+        self.token_merger = _build_token_merger(self.merge_config) if self.merge_config.enabled else None
+
+        self.use_activation_checkpointing = use_activation_checkpointing
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
+        # Tokenize pixels with convolution
+        if self.is_video:
+            self.patch_embed = PatchEmbed3D(
+                patch_size=patch_size, tubelet_size=tubelet_size, in_chans=in_chans, embed_dim=embed_dim
+            )
+            self.num_patches = (num_frames // tubelet_size) * (img_size[0] // patch_size) * (img_size[1] // patch_size)
+        else:
+            self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+            self.num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
+
+        # Position embedding
+        self.uniform_power = uniform_power
+        self.use_rope = use_rope
+        if self.use_rope:
+            self.pos_embed = None
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=False)
+
+        # Attention Blocks
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    use_rope=use_rope,
+                    grid_size=img_size[0] // patch_size,
+                    grid_depth=num_frames // tubelet_size,
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    use_sdpa=use_sdpa,
+                    qkv_bias=qkv_bias,
+                    qk_scale=qk_scale,
+                    drop=drop_rate,
+                    act_layer=nn.SiLU if use_silu else nn.GELU,
+                    wide_silu=wide_silu,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = norm_layer(embed_dim)
+
+        # ------ initialize weights
+        if self.pos_embed is not None:
+            self._init_pos_embed(self.pos_embed.data)  # sincos pos-embed
+        self.init_std = init_std
+        self.apply(self._init_weights)
+        self._rescale_blocks()
+
+    def _init_pos_embed(self, pos_embed):
+        embed_dim = pos_embed.size(-1)
+        grid_size = self.img_height // self.patch_size  # TODO: update; currently assumes square input
+        if self.is_video:
+            grid_depth = self.num_frames // self.tubelet_size
+            sincos = get_3d_sincos_pos_embed(
+                embed_dim, grid_size, grid_depth, cls_token=False, uniform_power=self.uniform_power
+            )
+        else:
+            sincos = get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False)
+        pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=self.init_std)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            trunc_normal_(m.weight, std=self.init_std)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv3d):
+            trunc_normal_(m.weight, std=self.init_std)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def _rescale_blocks(self):
+        def rescale(param, layer_id):
+            param.div_(math.sqrt(2.0 * layer_id))
+
+        for layer_id, layer in enumerate(self.blocks):
+            rescale(layer.attn.proj.weight.data, layer_id + 1)
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+
+    def get_num_layers(self):
+        return len(self.blocks)
+
+    def no_weight_decay(self):
+        return {}
+
+    def forward(self, x, masks=None, return_merge_info=False, restore_dense=None):
+        """
+        :param x: input image/video
+        :param masks: indices of patch tokens to mask (remove)
+        """
+        profile_enabled = bool(getattr(self.merge_config, "profile", False))
+        profile_device = x.device
+        profile_total_start = _profile_now(profile_device, profile_enabled)
+        profile = {
+            "profile_enabled": bool(profile_enabled),
+            "patch_embed_ms": 0.0,
+            "pre_merge_blocks_ms": 0.0,
+            "merge_module_ms": 0.0,
+            "post_merge_blocks_ms": 0.0,
+            "norm_ms": 0.0,
+            "restore_dense_ms": 0.0,
+            "total_profiled_ms": 0.0,
+        }
+        merge_enabled = bool(self.merge_config.enabled)
+        restore_dense = self.merge_config.restore_dense if restore_dense is None else bool(restore_dense)
+        if merge_enabled and masks is not None:
+            raise NotImplementedError("encoder-side token merge currently supports unmasked full-token video inputs only")
+        if merge_enabled and not self.is_video:
+            raise NotImplementedError("encoder-side token merge currently supports video inputs only")
+        if merge_enabled and not self.use_rope:
+            raise NotImplementedError("encoder-side token merge currently requires RoPE token ids")
+        if merge_enabled and self.token_merger is None:
+            self.token_merger = _build_token_merger(self.merge_config)
+
+        if masks is not None and not isinstance(masks, list):
+            masks = [masks]
+
+        # Tokenize input
+        # Image
+        if x.ndim == 4:
+            _, _, H, W = x.shape
+            T = 1
+        # Video
+        elif x.ndim == 5:
+            _, _, T, H, W = x.shape
+            T = T // self.tubelet_size
+        H_patches = H // self.patch_size
+        W_patches = W // self.patch_size
+        if not self.handle_nonsquare_inputs:
+            T = H_patches = W_patches = None
+
+        patch_start = _profile_now(profile_device, profile_enabled)
+        if not self.use_rope:
+            pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
+            x = self.patch_embed(x)
+            x += pos_embed
+        else:
+            x = self.patch_embed(x)
+        profile["patch_embed_ms"] = (
+            _profile_now(profile_device, profile_enabled) - patch_start
+        ) * 1000.0
+
+        original_num_tokens = x.shape[1]
+        token_ids = token_size = rep_for_orig = None
+        merge_infos = []
+        if merge_enabled:
+            token_ids, token_size, rep_for_orig = init_token_merge_state(
+                x.shape[0],
+                original_num_tokens,
+                x.device,
+                x.dtype,
+            )
+
+        # Mask away unwanted tokens (if masks provided)
+        if masks is not None:
+            x = apply_masks(x, masks)
+            masks = torch.cat(masks, dim=0)
+
+        # Arm the post-RoPE key stash on the attention modules of the merge
+        # layers ONLY for the grid-agnostic K-BSM strategy with the key metric.
+        # Every other strategy leaves the flag unset so attention is byte-for-byte
+        # unchanged. (RoPEAttention.forward reads getattr(self, "_stash_attn_key",
+        # False) and pays nothing when it is False.)
+        # Both grid-agnostic BSM strategies use the post-RoPE Key cosine metric;
+        # arm the stash for K-BSM AND PiToMe (energy partition still matches/merges
+        # on the Key, identical to K-BSM). Any other strategy leaves the flag unset.
+        bsm_key_metric = (
+            merge_enabled
+            and getattr(self.merge_config, "strategy", "")
+            in ("bsm_ksim_gradual_vec", "bsm_pitome_gradual_vec", "bsm_taware_gradual_vec")
+            and (getattr(self.merge_config, "bsm_match_metric", "key") in ("key", "key_prerope")
+                 or (__import__("os").environ.get("WAM_REPORT_KEYS") == "1"      # diagnostics only (edge_stats.py)
+                     and getattr(self.merge_config, "bsm_match_metric", "key") in ("position", "random")))
+        )
+        # "key_prerope" = the original ToMe metric: head-mean key BEFORE the rotary embedding
+        stash_mode = "pre" if getattr(self.merge_config, "bsm_match_metric", "key") == "key_prerope" else True
+        if merge_enabled:
+            merge_layer_set = set(int(j) for j in self.merge_config.merge_layers)
+            for j, blk_j in enumerate(self.blocks):
+                attn_j = getattr(blk_j, "attn", None)
+                if attn_j is not None:
+                    attn_j._stash_attn_key = stash_mode if (bsm_key_metric and j in merge_layer_set) else False
+                    attn_j._stash_attn_entropy = (str(getattr(self.merge_config, "saliency_weight", "none")) in ("vidtldr", "vidtldr_shuffle")
+                                                  and j in merge_layer_set)
+
+        # Fwd prop
+        outs = []
+        block_segment_start = _profile_now(profile_device, profile_enabled)
+        seen_merge = False
+        for i, blk in enumerate(self.blocks):
+            if self.use_activation_checkpointing:
+                if merge_enabled and bool(getattr(self.merge_config, "prop_attn", False)):
+                    raise NotImplementedError("prop_attn is not wired into the activation-checkpointing path")
+                x = torch.utils.checkpoint.checkpoint(
+                    blk,
+                    x,
+                    token_ids if merge_enabled else masks,
+                    None,
+                    T=T,
+                    H_patches=H_patches,
+                    W_patches=W_patches,
+                    use_reentrant=False,
+                )
+            else:
+                # Optional ToMe proportional attention: after the first merge, every key gets a
+                # log(size) logit bias so a merged group keeps the attention mass of the tokens it
+                # stands for. Off by default (published configs pass attn_mask=None, unchanged).
+                attn_bias = None
+                if merge_enabled and seen_merge and bool(getattr(self.merge_config, "prop_attn", False)):
+                    bdt = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else x.dtype
+                    attn_bias = token_size.float().clamp_min(1.0).log()[:, None, None, :].to(bdt)
+                mid_merge = (merge_enabled and i in self.merge_config.merge_layers
+                             and str(getattr(self.merge_config, "merge_point", "post")) == "mid")
+                mid_state = {}
+                if mid_merge:
+                    def _mid_hook(xm, blk=blk, i=i, mid_state=mid_state):
+                        attn_mod = blk.attn
+                        a_key = getattr(attn_mod, "_stashed_key", None)
+                        attn_mod._stashed_key = None
+                        self.token_merger._attn_entropy = getattr(attn_mod, "_stashed_entropy", None)
+                        attn_mod._stashed_entropy = None
+                        self.token_merger._block_index = i
+                        self.token_merger._num_blocks = len(self.blocks)
+                        mid_state["out"] = self.token_merger(
+                            x=xm, token_ids=token_ids, token_size=token_size, rep_for_orig=rep_for_orig,
+                            t_grid=T, h_grid=H_patches, w_grid=W_patches, attn_key=a_key)
+                        return mid_state["out"][0]
+                    blk._mid_merge = _mid_hook
+                x = blk(
+                    x,
+                    mask=token_ids if merge_enabled else masks,
+                    attn_mask=attn_bias,
+                    T=T,
+                    H_patches=H_patches,
+                    W_patches=W_patches,
+                )
+                if mid_merge:
+                    blk._mid_merge = None
+                    _, token_ids, token_size, rep_for_orig, info = mid_state["out"]
+                    info["layer"] = int(i)
+                    info["original_num_tokens"] = int(original_num_tokens)
+                    info["restore_dense"] = bool(restore_dense)
+                    info["sequence_reduced"] = True
+                    info["merge_point"] = "mid"
+                    merge_infos.append(info)
+                    seen_merge = True
+                    block_segment_start = _profile_now(profile_device, profile_enabled)
+            if (merge_enabled and i in self.merge_config.merge_layers
+                    and str(getattr(self.merge_config, "merge_point", "post")) != "mid"):
+                block_segment_end = _profile_now(profile_device, profile_enabled)
+                block_segment_ms = (block_segment_end - block_segment_start) * 1000.0
+                if seen_merge:
+                    profile["post_merge_blocks_ms"] += block_segment_ms
+                else:
+                    profile["pre_merge_blocks_ms"] += block_segment_ms
+                before = x.shape[1]
+                # Read the post-RoPE key stashed by THIS block's attention (set
+                # only for bsm_ksim_gradual_vec with the key metric). None for
+                # every other strategy -> merger uses hidden-feature cosine.
+                attn_key = None
+                attn_mod = getattr(blk, "attn", None)
+                if attn_mod is not None:
+                    attn_key = getattr(attn_mod, "_stashed_key", None)
+                    attn_mod._stashed_key = None  # release reference promptly
+                    self.token_merger._attn_entropy = getattr(attn_mod, "_stashed_entropy", None)   # vid-TLDR only
+                    attn_mod._stashed_entropy = None
+                self.token_merger._block_index = i          # used only by the published PiToMe margin
+                self.token_merger._num_blocks = len(self.blocks)
+                merge_start = _profile_now(profile_device, profile_enabled)
+                x, token_ids, token_size, rep_for_orig, info = self.token_merger(
+                    x=x,
+                    token_ids=token_ids,
+                    token_size=token_size,
+                    rep_for_orig=rep_for_orig,
+                    t_grid=T,
+                    h_grid=H_patches,
+                    w_grid=W_patches,
+                    attn_key=attn_key,
+                )
+                measured_merge_ms = (
+                    _profile_now(profile_device, profile_enabled) - merge_start
+                ) * 1000.0
+                profile["merge_module_ms"] += measured_merge_ms
+                info["layer"] = int(i)
+                info["original_num_tokens"] = int(original_num_tokens)
+                info["restore_dense"] = bool(restore_dense)
+                info["sequence_reduced"] = bool(x.shape[1] < before)
+                info["measured_merge_ms"] = float(measured_merge_ms)
+                merge_infos.append(info)
+                seen_merge = True
+                block_segment_start = _profile_now(profile_device, profile_enabled)
+            if self.out_layers is not None and i in self.out_layers:
+                out = self.norm(x)
+                if merge_enabled and restore_dense:
+                    out = restore_dense_tokens(out, token_ids, rep_for_orig, original_num_tokens)
+                outs.append(out)
+
+        if self.out_layers is not None:
+            if return_merge_info:
+                self.last_forward_profile = profile
+                return outs, merge_infos
+            return outs
+
+        block_segment_end = _profile_now(profile_device, profile_enabled)
+        block_segment_ms = (block_segment_end - block_segment_start) * 1000.0
+        if seen_merge:
+            profile["post_merge_blocks_ms"] += block_segment_ms
+        else:
+            profile["pre_merge_blocks_ms"] += block_segment_ms
+
+        norm_start = _profile_now(profile_device, profile_enabled)
+        if self.norm is not None:
+            x = self.norm(x)
+        profile["norm_ms"] = (
+            _profile_now(profile_device, profile_enabled) - norm_start
+        ) * 1000.0
+
+        # Expose the final merge state so callers can cache compressed tokens together
+        # with their representative map (read-only; does not change any output).
+        self.last_merge_state = (token_ids, token_size, rep_for_orig) if merge_enabled else None
+        restore_start = _profile_now(profile_device, profile_enabled)
+        if merge_enabled and restore_dense:
+            x = restore_dense_tokens(x, token_ids, rep_for_orig, original_num_tokens)
+        profile["restore_dense_ms"] = (
+            _profile_now(profile_device, profile_enabled) - restore_start
+        ) * 1000.0
+        profile["total_profiled_ms"] = (
+            _profile_now(profile_device, profile_enabled) - profile_total_start
+        ) * 1000.0
+        profile["tokens_final"] = int(x.shape[1])
+        profile["tokens_original"] = int(original_num_tokens)
+        self.last_forward_profile = profile
+
+        if return_merge_info:
+            return x, merge_infos
+        return x
+
+    def interpolate_pos_encoding(self, x, pos_embed):
+
+        _, N, dim = pos_embed.shape
+
+        if self.is_video:
+
+            # If pos_embed already correct size, just return
+            _, _, T, H, W = x.shape
+            if H == self.img_height and W == self.img_width and T == self.num_frames:
+                return pos_embed
+
+            # Just chop off last N tokens of positional embedding
+            elif H == self.img_height and W == self.img_width and T < self.num_frames:
+                new_N = int((T // self.tubelet_size) * (H // self.patch_size) * (W // self.patch_size))
+                return pos_embed[:, :new_N, :]
+
+            # Convert depth, height, width of input to be measured in patches
+            # instead of pixels/frames
+            T = T // self.tubelet_size
+            H = H // self.patch_size
+            W = W // self.patch_size
+
+            # Compute the initialized shape of the positional embedding measured
+            # in patches
+            N_t = self.num_frames // self.tubelet_size
+            N_h = self.img_height // self.patch_size
+            N_w = self.img_width // self.patch_size
+            assert N_h * N_w * N_t == N, "Positional embedding initialized incorrectly"
+
+            # Compute scale factor for spatio-temporal interpolation
+            scale_factor = (T / N_t, H / N_h, W / N_w)
+
+            pos_embed = nn.functional.interpolate(
+                pos_embed.reshape(1, N_t, N_h, N_w, dim).permute(0, 4, 1, 2, 3),
+                scale_factor=scale_factor,
+                mode="trilinear",
+            )
+            pos_embed = pos_embed.permute(0, 2, 3, 4, 1).view(1, -1, dim)
+            return pos_embed
+
+        else:
+
+            # If pos_embed already correct size, just return
+            _, _, H, W = x.shape
+            if H == self.img_height and W == self.img_width:
+                return pos_embed
+
+            # Compute scale factor for spatial interpolation
+            npatch = (H // self.patch_size) * (W // self.patch_size)
+            scale_factor = math.sqrt(npatch / N)
+
+            pos_embed = nn.functional.interpolate(
+                pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
+                scale_factor=scale_factor,
+                mode="bicubic",
+            )
+            pos_embed = pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+            return pos_embed
+
+
+def vit_large(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_huge(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1280,
+        depth=32,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_giant_xformers(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1408,
+        depth=40,
+        num_heads=22,
+        mlp_ratio=48 / 11,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+# We do not use any of the following ViT definitions in V-JEPA 2, but retain them for
+# compatibility reasons.
+def vit_synthetic(patch_size=16, **kwargs):
+    # For performance testing only
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1,
+        depth=1,
+        num_heads=1,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_tiny(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=192,
+        depth=12,
+        num_heads=3,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_small(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_base(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_large_rope(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        use_rope=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_huge_rope(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1280,
+        depth=32,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        use_rope=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_giant(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1408,
+        depth=40,
+        num_heads=16,
+        mlp_ratio=48 / 11,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_giant_rope(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1408,
+        depth=40,
+        num_heads=16,
+        mlp_ratio=48 / 11,
+        qkv_bias=True,
+        use_rope=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_giant_xformers_rope(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1408,
+        depth=40,
+        num_heads=22,
+        mlp_ratio=48 / 11,
+        qkv_bias=True,
+        use_rope=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_gigantic(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1664,
+        depth=48,
+        num_heads=16,
+        mpl_ratio=64 / 13,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_gigantic_xformers(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1664,
+        depth=48,
+        num_heads=26,
+        mpl_ratio=64 / 13,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+VIT_EMBED_DIMS = {
+    "vit_synthetic": 1,
+    "vit_tiny": 192,
+    "vit_small": 384,
+    "vit_base": 768,
+    "vit_large": 1024,
+    "vit_huge": 1280,
+    "vit_giant": 1408,
+    "vit_gigantic": 1664,
+}
