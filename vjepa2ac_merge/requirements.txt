@@ -1,0 +1,12 @@
+# Python 3.10+, CUDA GPU with 24 GB (RTX 3090 tested). Install torch for your CUDA first.
+torch>=2.3        # tested 2.6.0+cu124, Python 3.11
+numpy
+scipy
+pillow
+timm              # tested 1.0.26
+einops
+# simulation (sim_env.py, s3_collect.py, sim_run.py, t1_landscape.py, s4_train.py rel)
+robosuite==1.5.1
+mujoco==3.3.0
+# real DROID data (d1_droid.py prep only)
+tfrecord

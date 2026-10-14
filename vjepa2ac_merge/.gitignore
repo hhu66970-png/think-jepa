@@ -1,0 +1,5 @@
+# created by the pipeline (see scripts/run_sim.sh)
+vjepa2_official/
+ckpt/
+cache/
+data/

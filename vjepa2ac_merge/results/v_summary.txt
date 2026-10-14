@@ -1,0 +1,121 @@
+== C1 closed loop, fresh episodes 2000-2099 (c1)
+arm                       eps  success  final cm  plan s
+s3_few28                  100     0.58      4.82    5.96
+s3bk0_few102              100     0.96      2.69   19.70
+s3bk0_few28               100     0.83      3.61    3.51
+s3bk0_stack_sim           100     0.18     11.48    3.16
+s3bk1_few28               100     0.70      4.21    6.43
+s3bk2_few28               100     0.78      3.92    5.74
+s4k0_sim16                100     0.81      3.94    6.27
+s4k0_stack_pool           100     0.95      2.52    5.00
+s4k0_stack_sim            100     0.92      2.62    3.16
+s4k1_stack_sim            100     0.95      2.34    4.01
+s4k2_stack_sim            100     0.93      2.54    6.25
+-- H1 (primary): METHOD (S4 k, sim n=64, 102 samples) - CONTROL (S3b k, 256 tokens, 28 samples)
+H1 pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.163 [+0.090, +0.240], final cm -1.413 [-1.836, -0.981]
+   seed pair 0 (n = 100 episodes): success +0.090 [+0.000, +0.180], final cm -0.991 [-1.522, -0.420]
+   seed pair 1 (n = 100 episodes): success +0.250 [+0.150, +0.350], final cm -1.872 [-2.362, -1.400]
+   seed pair 2 (n = 100 episodes): success +0.150 [+0.060, +0.240], final cm -1.375 [-1.852, -0.888]
+-- H2: METHOD k0 - S3b k0 with 102 samples (non inferiority margin -0.10 success)
+H2 (n = 100 episodes): success -0.040 [-0.100, +0.020], final cm -0.071 [-0.457, +0.402]
+-- H5 (addendum): METHOD k0 - same merging with the plain (S3b k0) predictor
+H5 (n = 100 episodes): success +0.740 [+0.650, +0.820], final cm -8.853 [-10.570, -7.299]
+VERDICT H5: holds
+-- secondary
+pool n=64 102 (S4 k0) - CONTROL k0 (n = 100 episodes): success +0.120 [+0.040, +0.200], final cm -1.096 [-1.551, -0.638]
+sim n=16 400 (merging alone) - METHOD k0 (n = 100 episodes): success -0.110 [-0.190, -0.030], final cm +1.318 [+0.777, +1.914]
+S3 28 samples - S3b k0 28 samples (extra plain training) (n = 100 episodes): success -0.250 [-0.340, -0.160], final cm +1.201 [+0.896, +1.500]
+S3b k0: 102 - 28 samples (n = 100 episodes): success +0.130 [+0.050, +0.210], final cm -0.921 [-1.309, -0.541]
+VERDICT H1: holds (success lower bound +0.090); H1b: holds
+VERDICT H2: not shown (lower bound -0.100)
+
+== D1 validation loss (step: loss); chosen {'plain': 250, 'merge': 500}
+   plain: 0: 0.7469, 250: 0.6658, 500: 0.6771, 1000: 0.6955
+   merge: 0: 0.9557, 250: 0.9062, 500: 0.9060, 1000: 0.9065
+== D1 test (real DROID, 200 transitions from 19 episodes): cosine of plan
+off_few28        cos 0.551  plan s 6.48
+dp_few28         cos 0.426  plan s 6.42
+dm_sim64s102     cos 0.307  plan s 5.80
+dm_pool64s102    cos 0.414  plan s 5.82
+off_sim64s102    cos 0.033  plan s 5.83
+dp_few102        cos 0.370  plan s 22.15
+dm_sim16         cos 0.155  plan s 6.69
+-- H3 (primary)
+METHOD - DP few28: -0.119 [-0.225, -0.012]   (episode cluster bootstrap -0.119 [-0.288, +0.044])
+METHOD - official few28: -0.244 [-0.351, -0.137]   (episode cluster bootstrap -0.244 [-0.484, -0.009])
+-- H4
+METHOD - DP few102: -0.063 [-0.168, +0.038]   (episode cluster bootstrap -0.063 [-0.183, +0.054])
+-- secondary
+METHOD - official sim n=64 102 (frozen merging): +0.274 [+0.157, +0.389]   (episode cluster bootstrap +0.274 [+0.129, +0.432])
+DM pool n=64 102 - DP few28: -0.012 [-0.102, +0.078]   (episode cluster bootstrap -0.012 [-0.125, +0.100])
+DM sim n=16 400 - METHOD: -0.152 [-0.247, -0.056]   (episode cluster bootstrap -0.152 [-0.277, -0.012])
+DP 102 - 28 samples: -0.056 [-0.121, +0.010]   (episode cluster bootstrap -0.056 [-0.156, +0.053])
+DP few28 - official few28: -0.125 [-0.212, -0.041]   (episode cluster bootstrap -0.125 [-0.305, +0.036])
+VERDICT H3: not shown; H4: not shown (lower bound -0.168)
+
+== C3 tighter budget (about 10.8k tokens per CEM iteration), episodes 4000-4099 (c3)
+arm                       eps  success  final cm  plan s
+s3bk0_few14               100     0.40      7.03    3.75
+s3bk0_few28c5             100     0.55      5.06    3.57
+s3bk1_few14               100     0.37      7.63    2.95
+s3bk1_few28c5             100     0.46      5.74    2.99
+s3bk2_few14               100     0.41      7.23    3.49
+s3bk2_few28c5             100     0.53      5.41    2.49
+s4k0_sim16s200            100     0.77      3.86    3.30
+s4k0_stack51_sim          100     0.92      3.01    3.50
+s4k1_stack51_sim          100     0.89      3.30    3.23
+s4k2_stack51_sim          100     0.90      2.70    3.30
+-- H6 (primary for C3): METHOD3 (S4 k, sim n=64, 51 samples) - CONTROL3 (S3b k, 14 samples)
+H6 pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.510 [+0.407, +0.610], final cm -4.294 [-5.192, -3.449]
+   seed pair 0 (n = 100 episodes): success +0.520 [+0.410, +0.630], final cm -4.022 [-4.949, -3.138]
+   seed pair 1 (n = 100 episodes): success +0.520 [+0.410, +0.620], final cm -4.330 [-5.306, -3.416]
+   seed pair 2 (n = 100 episodes): success +0.490 [+0.370, +0.600], final cm -4.531 [-5.425, -3.684]
+H6b: METHOD3 k0 - 28 samples x 5 iterations k0 (n = 100 episodes): success +0.370 [+0.260, +0.470], final cm -2.050 [-2.644, -1.486]
+H6b pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.390 [+0.293, +0.487], final cm -2.400 [-2.961, -1.876]
+-- secondary
+sim n=16 200 - METHOD3 k0 (n = 100 episodes): success -0.150 [-0.240, -0.060], final cm +0.855 [+0.323, +1.444]
+baselines: 28 x 5 - 14 x 10 (n = 100 episodes): success +0.150 [+0.050, +0.250], final cm -1.972 [-2.597, -1.372]
+VERDICT H6: holds
+
+== C4 tighter still (about 5.4k tokens per CEM iteration), episodes 5000-5099 (c4)
+arm                       eps  success  final cm  plan s
+s3bk0_few14c5             100     0.29      7.46    1.89
+s3bk0_few14c7             100     0.38      7.01    2.43
+s3bk0_few28c2             100     0.44      5.82    1.28
+s3bk0_few28c4             100     0.53      5.56    2.44
+s3bk1_few14c5             100     0.33      7.84    1.84
+s3bk1_few14c7             100     0.36      7.40    2.47
+s3bk1_few28c2             100     0.39      6.39    1.36
+s3bk1_few28c4             100     0.41      6.35    2.42
+s3bk2_few14c5             100     0.30      7.69    1.63
+s3bk2_few14c7             100     0.38      7.29    2.40
+s3bk2_few28c2             100     0.46      6.14    1.14
+s3bk2_few28c4             100     0.42      5.87    2.37
+s4k0_sim16s100            100     0.82      3.45    2.05
+s4k0_stack26_sim          100     0.73      3.87    2.30
+s4k1_stack26_sim          100     0.71      4.07    1.99
+s4k2_stack26_sim          100     0.84      3.35    2.26
+H7a: METHOD4 - 14 samples x 5 iterations (n = 100 episodes): success +0.440 [+0.330, +0.550], final cm -3.587 [-4.419, -2.789]
+H7b: METHOD4 - 28 samples x 2 iterations (n = 100 episodes): success +0.290 [+0.160, +0.410], final cm -1.946 [-2.711, -1.199]
+H7 vs few14c5 pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.453 [+0.357, +0.550], final cm -3.898 [-4.734, -3.108]
+H7 vs few28c2 pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.330 [+0.227, +0.430], final cm -2.350 [-3.128, -1.608]
+secondary: sim n=16 100 - METHOD4 (n = 100 episodes): success +0.090 [-0.010, +0.190], final cm -0.420 [-0.952, +0.156]
+VERDICT H7: holds
+-- H8 (addendum): METHOD4 - baselines at equal wall clock (T3), pooled over seed pairs
+H8 vs few28c4 pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.307 [+0.213, +0.403], final cm -2.156 [-2.774, -1.579]
+   seed pair 0 (n = 100 episodes): success +0.200 [+0.080, +0.320], final cm -1.681 [-2.339, -1.038]
+   seed pair 1 (n = 100 episodes): success +0.300 [+0.170, +0.430], final cm -2.273 [-2.929, -1.635]
+   seed pair 2 (n = 100 episodes): success +0.420 [+0.310, +0.540], final cm -2.515 [-3.189, -1.880]
+H8 vs few14c7 pooled seeds [0, 1, 2] (n = 100 episodes, 3 seed pairs): success +0.387 [+0.290, +0.483], final cm -3.467 [-4.250, -2.709]
+   seed pair 0 (n = 100 episodes): success +0.350 [+0.230, +0.470], final cm -3.136 [-3.914, -2.370]
+   seed pair 1 (n = 100 episodes): success +0.350 [+0.230, +0.460], final cm -3.327 [-4.139, -2.534]
+   seed pair 2 (n = 100 episodes): success +0.460 [+0.350, +0.570], final cm -3.939 [-4.791, -3.099]
+VERDICT H8: holds
+
+== C2 harder reach (20-30 cm, 15 steps) (c2)
+arm                       eps  success  final cm  plan s
+s3bk0_few28               100     0.86      3.39    6.90
+s4k0_stack_sim            100     0.90      2.70    6.21
+C2: METHOD k0 - CONTROL k0 (n = 100 episodes): success +0.040 [-0.040, +0.120], final cm -0.681 [-1.104, -0.237]
+VERDICT C2: not shown
+
